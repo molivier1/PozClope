@@ -1,5 +1,36 @@
 # 24h du code
 
+## Commandes
+
+### Afficher la carte
+
+Instance 1 → node server.js
+
+Permet de faire tourner le leaderboard
+
+Instance 2 → npm.cmd run dev
+
+
+### Afficher nos vaisseaux
+
+npm.cmd run game -- team        
+
+npm.cmd run game -- ships
+
+### Infos market
+
+npm.cmd run getmodel -- --json
+
+
+
+
+
+
+
+
+
+
+
 ## Lancement
 
 ```powershell
