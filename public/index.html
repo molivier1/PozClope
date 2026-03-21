@@ -102,14 +102,24 @@
       <main class="board-panel">
         <section class="panel map-panel">
           <div class="map-header">
-            <div>
+            <div class="map-header-copy">
               <p class="eyebrow">Vue 58 x 58</p>
               <h2>Carte tactique</h2>
+              <p class="muted map-subtitle">
+                La grille complete est affichee, avec focus automatique sur la
+                zone utile.
+              </p>
             </div>
-            <p class="muted">
-              La grille complete est affichee, avec focus automatique sur la
-              zone utile.
-            </p>
+
+            <aside class="panel leaderboard-panel">
+              <div class="panel-heading">
+                <h2>Classement</h2>
+                <span id="leaderboardStatus" class="badge">...</span>
+              </div>
+              <ol id="leaderboardList" class="leaderboard-list empty-state">
+                <li>Classement indisponible.</li>
+              </ol>
+            </aside>
           </div>
 
           <div id="mapViewport" class="map-viewport">

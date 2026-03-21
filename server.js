@@ -15,20 +15,119 @@ const DEFAULT_RANGE = {
   x: [0, 15],
   y: [40, 50]
 };
+const LEADERBOARD_CANDIDATE_PATHS = [
+  "/equipes/classement",
+  "/classement",
+  "/leaderboard",
+  "/scoreboard",
+  "/equipes/leaderboard",
+  "/equipes/scores",
+  "/scores",
+  "/equipes"
+];
 
 for (const envPath of ENV_PATHS) {
   if (fs.existsSync(envPath)) {
-    dotenv.config({ path: envPath });
+    dotenv.config({ path: envPath, quiet: true });
     break;
   }
 }
 
 const PORT = Number(process.env.PORT || 3000);
 const API_URL = process.env.API_URL;
-const TOKEN = process.env.TOKEN?.trim();
+const STATIC_TOKEN = process.env.TOKEN?.trim();
 const TEAM_ID = process.env.TEAM_ID;
+const STATIC_TOKEN_METADATA = decodeJwtPayload(STATIC_TOKEN);
+const DERIVED_AUTH_CONFIG = deriveAuthConfig(STATIC_TOKEN_METADATA);
+const AUTH_BASE_URL =
+  process.env.KEYCLOAK_URL ??
+  process.env.AUTH_URL ??
+  DERIVED_AUTH_CONFIG.baseUrl ??
+  null;
+const AUTH_REALM =
+  process.env.KEYCLOAK_REALM ?? DERIVED_AUTH_CONFIG.realm ?? null;
+const AUTH_CLIENT_ID =
+  process.env.KEYCLOAK_CLIENT_ID ??
+  DERIVED_AUTH_CONFIG.clientId ??
+  "vaissals-backend";
+const AUTH_CLIENT_SECRET = process.env.KEYCLOAK_CLIENT_SECRET ?? null;
+const AUTH_USERNAME =
+  process.env.KEYCLOAK_USERNAME ?? DERIVED_AUTH_CONFIG.username ?? null;
+const AUTH_PASSWORD = process.env.KEYCLOAK_PASSWORD ?? null;
+const TOKEN_REFRESH_SKEW_MS = 60_000;
 
 const app = express();
+let cachedLeaderboardPath = null;
+const authState = {
+  accessToken: STATIC_TOKEN ?? null,
+  accessTokenExpMs: getTokenExpiryMs(STATIC_TOKEN),
+  refreshToken: null,
+  refreshTokenExpMs: 0
+};
+
+function decodeJwtPayload(token) {
+  if (!token) {
+    return null;
+  }
+
+  try {
+    const parts = token.split(".");
+
+    if (parts.length < 2) {
+      return null;
+    }
+
+    return JSON.parse(
+      Buffer.from(parts[1], "base64url").toString("utf8")
+    );
+  } catch (error) {
+    return null;
+  }
+}
+
+function getTokenExpiryMs(token) {
+  const payload = decodeJwtPayload(token);
+  const expiresAt = Number(payload?.exp);
+
+  return Number.isFinite(expiresAt) ? expiresAt * 1000 : 0;
+}
+
+function deriveAuthConfig(payload) {
+  if (!payload) {
+    return {};
+  }
+
+  let baseUrl = null;
+  let realm = null;
+
+  if (typeof payload.iss === "string") {
+    try {
+      const issuerUrl = new URL(payload.iss);
+      const marker = "/realms/";
+      const markerIndex = issuerUrl.pathname.indexOf(marker);
+
+      if (markerIndex >= 0) {
+        const basePath = issuerUrl.pathname.slice(0, markerIndex);
+        const realmPath = issuerUrl.pathname.slice(markerIndex + marker.length);
+
+        realm = realmPath.split("/")[0] || null;
+        baseUrl = `${issuerUrl.origin}${basePath}`;
+      } else {
+        baseUrl = issuerUrl.origin;
+      }
+    } catch (error) {
+      baseUrl = null;
+      realm = null;
+    }
+  }
+
+  return {
+    baseUrl,
+    realm,
+    clientId: payload.azp ?? null,
+    username: payload.preferred_username ?? null
+  };
+}
 
 function missingConfig() {
   const missing = [];
@@ -36,11 +135,11 @@ function missingConfig() {
   if (!API_URL) {
     missing.push("API_URL");
   }
-  if (!TOKEN) {
-    missing.push("TOKEN");
-  }
   if (!TEAM_ID) {
     missing.push("TEAM_ID");
+  }
+  if (!STATIC_TOKEN && !hasPasswordGrantConfig()) {
+    missing.push("TOKEN ou KEYCLOAK_USERNAME/KEYCLOAK_PASSWORD");
   }
 
   return missing;
@@ -49,6 +148,18 @@ function missingConfig() {
 function extractArray(payload) {
   if (Array.isArray(payload)) {
     return payload;
+  }
+  if (Array.isArray(payload?.teams)) {
+    return payload.teams;
+  }
+  if (Array.isArray(payload?.equipes)) {
+    return payload.equipes;
+  }
+  if (Array.isArray(payload?.leaderboard)) {
+    return payload.leaderboard;
+  }
+  if (Array.isArray(payload?.classement)) {
+    return payload.classement;
   }
   if (Array.isArray(payload?.content)) {
     return payload.content;
@@ -175,6 +286,337 @@ function normalizeShip(ship, index) {
   };
 }
 
+function isTokenUsable(expiresAtMs, skewMs = TOKEN_REFRESH_SKEW_MS) {
+  return Number.isFinite(expiresAtMs) && expiresAtMs - Date.now() > skewMs;
+}
+
+function hasPasswordGrantConfig() {
+  return Boolean(
+    AUTH_BASE_URL &&
+      AUTH_REALM &&
+      AUTH_CLIENT_ID &&
+      AUTH_USERNAME &&
+      AUTH_PASSWORD
+  );
+}
+
+function hasRefreshGrantConfig() {
+  return Boolean(
+    AUTH_BASE_URL &&
+      AUTH_REALM &&
+      AUTH_CLIENT_ID &&
+      authState.refreshToken &&
+      isTokenUsable(authState.refreshTokenExpMs, 0)
+  );
+}
+
+function canRefreshAuth() {
+  return hasRefreshGrantConfig() || hasPasswordGrantConfig();
+}
+
+function getAuthMode() {
+  if (hasPasswordGrantConfig()) {
+    return "keycloak-password-grant";
+  }
+
+  if (STATIC_TOKEN) {
+    return "static-token";
+  }
+
+  return "missing-auth";
+}
+
+function getTokenEndpointUrl() {
+  if (!AUTH_BASE_URL || !AUTH_REALM) {
+    return null;
+  }
+
+  return `${AUTH_BASE_URL}/realms/${AUTH_REALM}/protocol/openid-connect/token`;
+}
+
+function setAuthTokens(tokenPayload) {
+  authState.accessToken = tokenPayload.access_token ?? authState.accessToken;
+  authState.accessTokenExpMs = getTokenExpiryMs(authState.accessToken);
+
+  if (tokenPayload.refresh_token) {
+    authState.refreshToken = tokenPayload.refresh_token;
+    authState.refreshTokenExpMs = getTokenExpiryMs(authState.refreshToken);
+  }
+}
+
+function createHttpError(message, status) {
+  const error = new Error(message);
+  error.status = status;
+  return error;
+}
+
+async function requestToken(formData) {
+  const tokenEndpoint = getTokenEndpointUrl();
+
+  if (!tokenEndpoint) {
+    throw createHttpError(
+      "Configuration Keycloak incomplete. Ajoute AUTH_URL/KEYCLOAK_URL et KEYCLOAK_REALM.",
+      500
+    );
+  }
+
+  if (!AUTH_CLIENT_ID) {
+    throw createHttpError(
+      "Configuration Keycloak incomplete. Ajoute KEYCLOAK_CLIENT_ID.",
+      500
+    );
+  }
+
+  const payload = new URLSearchParams({
+    client_id: AUTH_CLIENT_ID,
+    ...formData
+  });
+
+  if (AUTH_CLIENT_SECRET) {
+    payload.set("client_secret", AUTH_CLIENT_SECRET);
+  }
+
+  const response = await fetch(tokenEndpoint, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    body: payload
+  });
+  const text = await response.text();
+  let json = null;
+
+  if (text) {
+    try {
+      json = JSON.parse(text);
+    } catch (error) {
+      json = null;
+    }
+  }
+
+  if (!response.ok) {
+    throw createHttpError(
+      `Echec recuperation token Keycloak (${response.status}).`,
+      response.status
+    );
+  }
+
+  if (!json?.access_token) {
+    throw createHttpError("Keycloak n'a pas retourne d'access_token.", 500);
+  }
+
+  setAuthTokens(json);
+  return authState.accessToken;
+}
+
+async function ensureAccessToken(options = {}) {
+  const { forceRefresh = false } = options;
+
+  if (!forceRefresh && isTokenUsable(authState.accessTokenExpMs)) {
+    return authState.accessToken;
+  }
+
+  if (hasRefreshGrantConfig()) {
+    try {
+      return await requestToken({
+        grant_type: "refresh_token",
+        refresh_token: authState.refreshToken
+      });
+    } catch (error) {
+      authState.refreshToken = null;
+      authState.refreshTokenExpMs = 0;
+    }
+  }
+
+  if (hasPasswordGrantConfig()) {
+    return requestToken({
+      grant_type: "password",
+      username: AUTH_USERNAME,
+      password: AUTH_PASSWORD
+    });
+  }
+
+  if (authState.accessToken && !forceRefresh && isTokenUsable(authState.accessTokenExpMs, 0)) {
+    return authState.accessToken;
+  }
+
+  if (STATIC_TOKEN && !AUTH_PASSWORD) {
+    throw createHttpError(
+      "TOKEN expire. Ajoute KEYCLOAK_USERNAME et KEYCLOAK_PASSWORD dans .env pour le renouveler automatiquement.",
+      401
+    );
+  }
+
+  throw createHttpError(
+    "Configuration d'authentification incomplete. Ajoute KEYCLOAK_USERNAME et KEYCLOAK_PASSWORD dans .env.",
+    401
+  );
+}
+
+async function authorizedFetch(pathname, options = {}) {
+  const { retryUnauthorized = true } = options;
+  const accessToken = await ensureAccessToken();
+  let response = await fetch(`${API_URL}${pathname}`, {
+    headers: {
+      Accept: "application/json",
+      Authorization: `Bearer ${accessToken}`
+    }
+  });
+
+  if (response.status === 401 && retryUnauthorized && canRefreshAuth()) {
+    authState.accessToken = null;
+    authState.accessTokenExpMs = 0;
+
+    const refreshedToken = await ensureAccessToken({ forceRefresh: true });
+
+    response = await fetch(`${API_URL}${pathname}`, {
+      headers: {
+        Accept: "application/json",
+        Authorization: `Bearer ${refreshedToken}`
+      }
+    });
+  }
+
+  return response;
+}
+
+function pickNestedValue(entity, keys) {
+  let queue = [entity];
+
+  for (let depth = 0; depth < 2; depth += 1) {
+    const nextQueue = [];
+
+    for (const current of queue) {
+      if (!current || typeof current !== "object" || Array.isArray(current)) {
+        continue;
+      }
+
+      for (const key of keys) {
+        const value = current[key];
+
+        if (value !== undefined && value !== null && value !== "") {
+          return value;
+        }
+      }
+
+      for (const value of Object.values(current)) {
+        if (value && typeof value === "object" && !Array.isArray(value)) {
+          nextQueue.push(value);
+        }
+      }
+    }
+
+    queue = nextQueue;
+  }
+
+  return null;
+}
+
+function collectArrays(payload, depth = 0) {
+  if (!payload || typeof payload !== "object" || depth > 2) {
+    return [];
+  }
+
+  const arrays = [];
+
+  for (const value of Object.values(payload)) {
+    if (Array.isArray(value)) {
+      arrays.push(value);
+      continue;
+    }
+
+    if (value && typeof value === "object") {
+      arrays.push(...collectArrays(value, depth + 1));
+    }
+  }
+
+  return arrays;
+}
+
+function normalizeLeaderboardEntry(entry, index) {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+    return null;
+  }
+
+  const score = Number(
+    pickNestedValue(entry, [
+      "score",
+      "points",
+      "point",
+      "nbPoints",
+      "totalPoints",
+      "scoreTotal",
+      "pointsVictoire",
+      "victoryPoints"
+    ])
+  );
+
+  if (!Number.isFinite(score)) {
+    return null;
+  }
+
+  const identifiant = pickNestedValue(entry, [
+    "identifiant",
+    "id",
+    "idEquipe",
+    "teamId"
+  ]);
+  const nom = pickNestedValue(entry, [
+    "nom",
+    "name",
+    "nomEquipe",
+    "teamName",
+    "label"
+  ]);
+  const rang = Number(
+    pickNestedValue(entry, ["rang", "rank", "position", "classement"])
+  );
+
+  return {
+    identifiant:
+      identifiant === null || identifiant === undefined
+        ? null
+        : String(identifiant),
+    nom: typeof nom === "string" && nom.trim() ? nom.trim() : `Equipe ${index + 1}`,
+    score,
+    rang: Number.isFinite(rang) ? rang : index + 1,
+    isCurrentTeam: String(identifiant ?? "") === TEAM_ID
+  };
+}
+
+function extractLeaderboard(payload) {
+  const candidates = [extractArray(payload), ...collectArrays(payload)];
+  let bestMatch = [];
+
+  for (const candidate of candidates) {
+    const normalized = candidate
+      .map(normalizeLeaderboardEntry)
+      .filter(Boolean);
+
+    if (normalized.length > bestMatch.length) {
+      bestMatch = normalized;
+    }
+  }
+
+  return bestMatch
+    .sort((left, right) => {
+      if (right.score !== left.score) {
+        return right.score - left.score;
+      }
+
+      if (left.rang !== right.rang) {
+        return left.rang - right.rang;
+      }
+
+      return left.nom.localeCompare(right.nom, "fr");
+    })
+    .map((entry, index) => ({
+      ...entry,
+      rang: index + 1
+    }));
+}
+
 function computeRangeFromShips(ships) {
   if (!ships.length) {
     return DEFAULT_RANGE;
@@ -196,19 +638,96 @@ function computeRangeFromShips(ships) {
 }
 
 async function apiGet(pathname) {
-  const response = await fetch(`${API_URL}${pathname}`, {
-    headers: {
-      Accept: "application/json",
-      Authorization: `Bearer ${TOKEN}`
-    }
-  });
+  const response = await authorizedFetch(pathname);
 
   if (!response.ok) {
     const message = await response.text();
-    throw new Error(`API ${response.status} sur ${pathname}: ${message}`);
+    const error = new Error(`API ${response.status} sur ${pathname}: ${message}`);
+    error.status = response.status;
+    throw error;
   }
 
   return response.json();
+}
+
+async function apiProbe(pathname) {
+  const response = await authorizedFetch(pathname, {
+    retryUnauthorized: false
+  });
+  const text = await response.text();
+  let payload = null;
+
+  if (text) {
+    try {
+      payload = JSON.parse(text);
+    } catch (error) {
+      payload = null;
+    }
+  }
+
+  return {
+    ok: response.ok,
+    status: response.status,
+    text,
+    payload
+  };
+}
+
+async function fetchLeaderboard() {
+  const candidatePaths = cachedLeaderboardPath
+    ? [
+        cachedLeaderboardPath,
+        ...LEADERBOARD_CANDIDATE_PATHS.filter(
+          (pathname) => pathname !== cachedLeaderboardPath
+        )
+      ]
+    : [...LEADERBOARD_CANDIDATE_PATHS];
+  const attempts = [];
+
+  for (const pathname of candidatePaths) {
+    const result = await apiProbe(pathname);
+
+    attempts.push({
+      path: pathname,
+      status: result.status
+    });
+
+    if (!result.ok) {
+      continue;
+    }
+
+    const leaderboard = extractLeaderboard(result.payload);
+
+    if (leaderboard.length) {
+      cachedLeaderboardPath = pathname;
+
+      return {
+        sourcePath: pathname,
+        attempts,
+        leaderboard
+      };
+    }
+  }
+
+  const tokenCheck = await apiProbe(`/equipes/${TEAM_ID}/vaisseaux`);
+
+  if (tokenCheck.status === 401) {
+    const error = new Error(
+      "Token API expire ou invalide. Rafraichis le TOKEN dans .env."
+    );
+    error.status = 401;
+    throw error;
+  }
+
+  const attemptsLabel = attempts
+    .map((attempt) => `${attempt.path} (${attempt.status})`)
+    .join(", ");
+
+  const error = new Error(
+    `Classement introuvable avec les routes testees: ${attemptsLabel}`
+  );
+  error.status = 404;
+  throw error;
 }
 
 function ensureConfig(req, res, next) {
@@ -232,7 +751,12 @@ app.get("/api/health", (req, res) => {
   res.json({
     ok: true,
     mapSize: MAP_SIZE,
-    envLoadedFrom: ENV_PATHS.find((envPath) => fs.existsSync(envPath)) ?? null
+    envLoadedFrom: ENV_PATHS.find((envPath) => fs.existsSync(envPath)) ?? null,
+    authMode: getAuthMode(),
+    tokenExpiresAt:
+      authState.accessTokenExpMs > 0
+        ? new Date(authState.accessTokenExpMs).toISOString()
+        : null
   });
 });
 
@@ -301,12 +825,28 @@ app.get("/api/state", ensureConfig, async (req, res, next) => {
   }
 });
 
+app.get("/api/leaderboard", ensureConfig, async (req, res, next) => {
+  try {
+    const result = await fetchLeaderboard();
+
+    res.json({
+      fetchedAt: new Date().toISOString(),
+      sourcePath: result.sourcePath,
+      leaderboard: result.leaderboard
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.get(/^\/(?!api\/).*/, (req, res) => {
   res.sendFile(path.join(PUBLIC_DIR, "index.html"));
 });
 
 app.use((error, req, res, next) => {
-  res.status(500).json({
+  const status = Number.isInteger(error.status) ? error.status : 500;
+
+  res.status(status).json({
     error: error.message || "Erreur interne"
   });
 });

@@ -5,6 +5,7 @@ const RICH_PLANET_THRESHOLD = 2000;
 const state = {
   zoom: 1,
   ships: [],
+  leaderboard: [],
   cells: new Map(),
   cellElements: new Map(),
   range: {
@@ -12,6 +13,7 @@ const state = {
     y: [0, 57]
   },
   followShips: true,
+  unauthorized: false,
   refreshTimer: null,
   firstRenderDone: false
 };
@@ -31,6 +33,8 @@ const elements = {
   planetCount: document.querySelector("#planetCount"),
   richCount: document.querySelector("#richCount"),
   shipCount: document.querySelector("#shipCount"),
+  leaderboardStatus: document.querySelector("#leaderboardStatus"),
+  leaderboardList: document.querySelector("#leaderboardList"),
   fleetList: document.querySelector("#fleetList"),
   targetsList: document.querySelector("#targetsList"),
   rangeLabel: document.querySelector("#rangeLabel"),
@@ -165,6 +169,51 @@ function renderFleet() {
       `;
     })
     .join("");
+}
+
+function renderLeaderboard(entries, message) {
+  elements.leaderboardList.classList.remove("empty-state");
+
+  if (message) {
+    elements.leaderboardStatus.textContent = "indispo";
+    elements.leaderboardList.classList.add("empty-state");
+    elements.leaderboardList.innerHTML = `<li>${message}</li>`;
+    return;
+  }
+
+  if (!entries.length) {
+    elements.leaderboardStatus.textContent = "0 eq";
+    elements.leaderboardList.classList.add("empty-state");
+    elements.leaderboardList.innerHTML = "<li>Aucune equipe remontee.</li>";
+    return;
+  }
+
+  elements.leaderboardStatus.textContent = `${entries.length} eq`;
+  elements.leaderboardList.innerHTML = entries
+    .slice(0, 10)
+    .map((entry) => {
+      const itemClass = entry.isCurrentTeam ? "leaderboard-item--me" : "";
+
+      return `
+        <li class="${itemClass}">
+          <span class="leaderboard-rank">${entry.rang}</span>
+          <span class="leaderboard-name">${entry.nom}</span>
+          <span class="leaderboard-score">${entry.score}</span>
+        </li>
+      `;
+    })
+    .join("");
+}
+
+function setUnauthorizedState(message) {
+  state.unauthorized = true;
+  elements.statusText.textContent = message;
+  renderLeaderboard([], message);
+
+  if (state.refreshTimer) {
+    clearInterval(state.refreshTimer);
+    state.refreshTimer = null;
+  }
 }
 
 function renderTargets() {
@@ -346,7 +395,43 @@ function applyState(payload) {
   state.firstRenderDone = true;
 }
 
+async function refreshLeaderboard() {
+  if (state.unauthorized) {
+    return;
+  }
+
+  try {
+    const response = await fetch("/api/leaderboard", {
+      headers: {
+        Accept: "application/json"
+      }
+    });
+    const payload = await response.json();
+
+    if (!response.ok) {
+      if (response.status === 401) {
+        setUnauthorizedState(
+          "Token expire ou invalide. Remplace TOKEN dans .env puis redemarre le serveur."
+        );
+      }
+      throw new Error(payload.error || "Classement indisponible");
+    }
+
+    state.leaderboard = Array.isArray(payload.leaderboard)
+      ? payload.leaderboard
+      : [];
+    state.unauthorized = false;
+    renderLeaderboard(state.leaderboard);
+  } catch (error) {
+    renderLeaderboard([], error.message);
+  }
+}
+
 async function refreshState() {
+  if (state.unauthorized) {
+    return;
+  }
+
   elements.statusText.textContent = "Rafraichissement de la carte...";
 
   try {
@@ -359,6 +444,11 @@ async function refreshState() {
     const payload = await response.json();
 
     if (!response.ok) {
+      if (response.status === 401) {
+        setUnauthorizedState(
+          "Token expire ou invalide. Remplace TOKEN dans .env puis redemarre le serveur."
+        );
+      }
       throw new Error(payload.error || "Erreur API");
     }
 
@@ -366,6 +456,14 @@ async function refreshState() {
   } catch (error) {
     elements.statusText.textContent = error.message;
   }
+}
+
+async function refreshDashboard() {
+  if (state.unauthorized) {
+    return;
+  }
+
+  await Promise.allSettled([refreshState(), refreshLeaderboard()]);
 }
 
 function updateRefreshTimer() {
@@ -377,12 +475,12 @@ function updateRefreshTimer() {
   const delay = Number(elements.refreshSelect.value);
 
   if (delay > 0) {
-    state.refreshTimer = window.setInterval(refreshState, delay);
+    state.refreshTimer = window.setInterval(refreshDashboard, delay);
   }
 }
 
 function bindEvents() {
-  elements.refreshButton.addEventListener("click", refreshState);
+  elements.refreshButton.addEventListener("click", refreshDashboard);
   elements.refreshSelect.addEventListener("change", updateRefreshTimer);
   elements.followShipsToggle.addEventListener("change", (event) => {
     state.followShips = event.target.checked;
@@ -425,4 +523,5 @@ buildGrid();
 bindEvents();
 setZoom(1);
 updateRefreshTimer();
-refreshState();
+renderLeaderboard([], "Chargement...");
+refreshDashboard();
