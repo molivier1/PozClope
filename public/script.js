@@ -6,6 +6,7 @@ const state = {
   zoom: 1,
   ships: [],
   leaderboard: [],
+  economyPlan: null,
   cells: new Map(),
   cellElements: new Map(),
   range: {
@@ -33,6 +34,9 @@ const elements = {
   planetCount: document.querySelector("#planetCount"),
   richCount: document.querySelector("#richCount"),
   shipCount: document.querySelector("#shipCount"),
+  economyStatus: document.querySelector("#economyStatus"),
+  economySummary: document.querySelector("#economySummary"),
+  economyList: document.querySelector("#economyList"),
   leaderboardStatus: document.querySelector("#leaderboardStatus"),
   leaderboardList: document.querySelector("#leaderboardList"),
   fleetList: document.querySelector("#fleetList"),
@@ -197,7 +201,7 @@ function renderLeaderboard(entries, message) {
       return `
         <li class="${itemClass}">
           <span class="leaderboard-rank">${entry.rang}</span>
-          <span class="leaderboard-name">${entry.nom}</span>
+          <span class="leaderboard-name">[${entry.type}] ${entry.nom}</span>
           <span class="leaderboard-score">${entry.score}</span>
         </li>
       `;
@@ -208,12 +212,72 @@ function renderLeaderboard(entries, message) {
 function setUnauthorizedState(message) {
   state.unauthorized = true;
   elements.statusText.textContent = message;
+  renderEconomyPlan(null, message);
   renderLeaderboard([], message);
 
   if (state.refreshTimer) {
     clearInterval(state.refreshTimer);
     state.refreshTimer = null;
   }
+}
+
+function renderEconomyPlan(plan, message) {
+  elements.economyList.classList.remove("empty-state");
+
+  if (message) {
+    elements.economyStatus.textContent = "indispo";
+    elements.economySummary.innerHTML = `<span class="muted">${message}</span>`;
+    elements.economyList.classList.add("empty-state");
+    elements.economyList.innerHTML = `<li>${message}</li>`;
+    return;
+  }
+
+  if (!plan) {
+    elements.economyStatus.textContent = "-";
+    elements.economySummary.innerHTML = `<span class="muted">Pas encore d'analyse.</span>`;
+    elements.economyList.classList.add("empty-state");
+    elements.economyList.innerHTML = "<li>Pas encore de recommandations.</li>";
+    return;
+  }
+
+  elements.economyStatus.textContent = plan.summary.hasCargo ? "stable" : "setup";
+  elements.economySummary.innerHTML = `
+    <div class="economy-chip">
+      <strong>Ressources</strong>
+      <span>${plan.summary.minerai} minerai | ${plan.summary.credits} credits</span>
+    </div>
+    <div class="economy-chip">
+      <strong>Production</strong>
+      <span>${plan.summary.shipSlotsUsed}/${plan.summary.shipSlotCapacity} slots vaisseaux</span>
+    </div>
+    <div class="economy-chip">
+      <strong>Depot</strong>
+      <span>${plan.hubs[0] ? `${plan.hubs[0].nom} ${formatCoord(plan.hubs[0].coord_x, plan.hubs[0].coord_y)}` : "Aucun hub"}</span>
+    </div>
+    <div class="economy-chip">
+      <strong>Objectif</strong>
+      <span>${plan.visibleTargets[0] ? `${plan.visibleTargets[0].nom} ${formatCoord(plan.visibleTargets[0].coord_x, plan.visibleTargets[0].coord_y)}` : "Aucune cible"}</span>
+    </div>
+  `;
+
+  if (!plan.recommendations.length) {
+    elements.economyList.classList.add("empty-state");
+    elements.economyList.innerHTML = "<li>Aucune recommandation pour l'instant.</li>";
+    return;
+  }
+
+  elements.economyList.innerHTML = plan.recommendations
+    .map((recommendation) => {
+      return `
+        <li>
+          <strong>${recommendation.title}</strong>
+          <span>${recommendation.detail}</span>
+          <br />
+          <span>${recommendation.why}</span>
+        </li>
+      `;
+    })
+    .join("");
 }
 
 function renderTargets() {
@@ -373,6 +437,7 @@ function fitToFleet() {
 
 function applyState(payload) {
   state.ships = Array.isArray(payload.ships) ? payload.ships : [];
+  state.economyPlan = payload.economyPlan ?? null;
   state.range = payload.range ?? state.range;
   state.cells = new Map();
 
@@ -382,6 +447,7 @@ function applyState(payload) {
 
   renderMap();
   renderFleet();
+  renderEconomyPlan(state.economyPlan);
   renderTargets();
   updateMetrics();
 
@@ -523,5 +589,6 @@ buildGrid();
 bindEvents();
 setZoom(1);
 updateRefreshTimer();
+renderEconomyPlan(null, "Chargement...");
 renderLeaderboard([], "Chargement...");
 refreshDashboard();
