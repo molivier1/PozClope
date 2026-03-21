@@ -7,10 +7,6 @@
   },
   "dependencies": {
     "dotenv": "^17.3.1",
-<<<<<<< HEAD
     "express": "^4.21.2"
-=======
-    "express": "^5.2.1"
->>>>>>> ea2bfa7da08f94da090409925bda840d4558fda6
   }
 }
