@@ -3,7 +3,10 @@
   "private": true,
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js"
+    "dev": "node --watch server.js",
+    "test:harvest-loop": "node scripts/test-harvest-loop.js",
+    "game": "node scripts/game.js",
+    "farm": "node scripts/farm.js"
   },
   "dependencies": {
     "dotenv": "^17.3.1",

@@ -55,6 +55,7 @@ const AUTH_USERNAME =
   process.env.KEYCLOAK_USERNAME ?? DERIVED_AUTH_CONFIG.username ?? null;
 const AUTH_PASSWORD = process.env.KEYCLOAK_PASSWORD ?? null;
 const TOKEN_REFRESH_SKEW_MS = 60_000;
+const REQUEST_TIMEOUT_MS = 25_000;
 
 const app = express();
 let cachedLeaderboardPath = null;
@@ -62,7 +63,8 @@ const authState = {
   accessToken: STATIC_TOKEN ?? null,
   accessTokenExpMs: getTokenExpiryMs(STATIC_TOKEN),
   refreshToken: null,
-  refreshTokenExpMs: 0
+  refreshTokenExpMs: 0,
+  accessTokenPromise: null
 };
 
 function decodeJwtPayload(token) {
@@ -277,12 +279,114 @@ function normalizeShip(ship, index) {
   return {
     identifiant: ship.identifiant ?? ship.idVaisseau ?? ship.id ?? `ship-${index}`,
     nom: ship.nom ?? ship.name ?? `Vaisseau ${index + 1}`,
+    typeId: ship.modeleVaisseau?.id ?? ship.type?.id ?? null,
     type: ship.modeleVaisseau?.nom ?? ship.type?.nom ?? ship.type ?? null,
+    classeVaisseau:
+      ship.modeleVaisseau?.classeVaisseau ??
+      ship.type?.classeVaisseau ??
+      null,
     coord_x: x,
     coord_y: y,
     pointDeVie: Number(ship.pointDeVie ?? 0),
     vitesse: Number(ship.vitesse ?? 0),
-    mineraiTransporte: Number(ship.mineraiTransporte ?? 0)
+    mineraiTransporte: Number(ship.mineraiTransporte ?? 0),
+    capaciteTransport: Number(
+      ship.modeleVaisseau?.capaciteTransport ?? ship.type?.capaciteTransport ?? 0
+    ),
+    attaque: Number(ship.modeleVaisseau?.attaque ?? ship.type?.attaque ?? 0),
+    coutConstruction: Number(
+      ship.modeleVaisseau?.coutConstruction ?? ship.type?.coutConstruction ?? 0
+    ),
+    dateProchaineAction: ship.dateProchaineAction ?? null
+  };
+}
+
+function normalizeConstructibleType(type) {
+  if (!type) {
+    return null;
+  }
+
+  return {
+    identifiant: type.id ?? type.identifiant ?? null,
+    nom: type.nom ?? type.name ?? null,
+    classeVaisseau: type.classeVaisseau ?? null,
+    coutConstruction: Number(type.coutConstruction ?? 0),
+    capaciteTransport: Number(type.capaciteTransport ?? 0),
+    attaque: Number(type.attaque ?? 0),
+    pointDeVie: Number(type.pointDeVie ?? 0),
+    vitesse: Number(type.vitesse ?? 0)
+  };
+}
+
+function normalizeModule(module) {
+  if (!module) {
+    return null;
+  }
+
+  const paramModule = module.paramModule ?? {};
+
+  return {
+    identifiant: module.id ?? module.identifiant ?? null,
+    idPlanete: module.idPlanete ?? null,
+    proprietaire: module.proprietaire ?? null,
+    pointDeVie: Number(paramModule.pointDeVie ?? 0),
+    attaque: Number(paramModule.attaque ?? 0),
+    nombreSlotsOccupes: Number(paramModule.nombreSlotsOccupes ?? 0),
+    typeModule: paramModule.typeModule ?? null,
+    asset: paramModule.asset ?? null,
+    listeVaisseauxConstructible: extractArray(
+      paramModule.listeVaisseauxConstructible
+    )
+      .map(normalizeConstructibleType)
+      .filter(Boolean)
+  };
+}
+
+function normalizeTeamResource(resourceEntry) {
+  if (!resourceEntry) {
+    return null;
+  }
+
+  return {
+    identifiant:
+      resourceEntry.ressource?.idRessource ??
+      resourceEntry.ressource?.id ??
+      null,
+    nom: resourceEntry.ressource?.nom ?? null,
+    type: resourceEntry.ressource?.type ?? null,
+    description: resourceEntry.ressource?.description ?? "",
+    quantite: Number(resourceEntry.quantite ?? 0)
+  };
+}
+
+function normalizeOwnedPlanet(planet) {
+  const normalized = normalizePlanet(planet);
+
+  if (!normalized) {
+    return null;
+  }
+
+  return {
+    ...normalized,
+    modules: extractArray(planet?.modules).map(normalizeModule).filter(Boolean)
+  };
+}
+
+function normalizeTeam(team) {
+  return {
+    identifiant: team?.idEquipe ?? team?.identifiant ?? null,
+    nom: team?.nom ?? "Equipe inconnue",
+    type: team?.type ?? null,
+    nombreSlotVaisseaux: Number(team?.nombreSlotVaisseaux ?? 0),
+    ressources: extractArray(team?.ressources)
+      .map(normalizeTeamResource)
+      .filter(Boolean),
+    planetes: extractArray(team?.planetes)
+      .map(normalizeOwnedPlanet)
+      .filter(Boolean),
+    modules: extractArray(team?.modules)
+      .map(normalizeModule)
+      .filter(Boolean)
   };
 }
 
@@ -350,6 +454,39 @@ function createHttpError(message, status) {
   return error;
 }
 
+function describeFetchError(error) {
+  const code = error?.cause?.code ?? error?.code ?? null;
+
+  if (code === "UND_ERR_CONNECT_TIMEOUT") {
+    return "timeout de connexion";
+  }
+  if (code === "ECONNREFUSED") {
+    return "connexion refusee";
+  }
+  if (code === "ENOTFOUND") {
+    return "hote introuvable";
+  }
+  if (error?.name === "AbortError") {
+    return "timeout de requete";
+  }
+
+  return error?.message ?? "erreur reseau";
+}
+
+async function performFetch(url, options, contextLabel) {
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
+    });
+  } catch (error) {
+    throw createHttpError(
+      `${contextLabel}: ${describeFetchError(error)}`,
+      502
+    );
+  }
+}
+
 async function requestToken(formData) {
   const tokenEndpoint = getTokenEndpointUrl();
 
@@ -376,14 +513,18 @@ async function requestToken(formData) {
     payload.set("client_secret", AUTH_CLIENT_SECRET);
   }
 
-  const response = await fetch(tokenEndpoint, {
-    method: "POST",
-    headers: {
-      Accept: "application/json",
-      "Content-Type": "application/x-www-form-urlencoded"
+  const response = await performFetch(
+    tokenEndpoint,
+    {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/x-www-form-urlencoded"
+      },
+      body: payload
     },
-    body: payload
-  });
+    "Impossible de joindre Keycloak"
+  );
   const text = await response.text();
   let json = null;
 
@@ -410,9 +551,7 @@ async function requestToken(formData) {
   return authState.accessToken;
 }
 
-async function ensureAccessToken(options = {}) {
-  const { forceRefresh = false } = options;
-
+async function refreshAccessToken(forceRefresh) {
   if (!forceRefresh && isTokenUsable(authState.accessTokenExpMs)) {
     return authState.accessToken;
   }
@@ -437,7 +576,11 @@ async function ensureAccessToken(options = {}) {
     });
   }
 
-  if (authState.accessToken && !forceRefresh && isTokenUsable(authState.accessTokenExpMs, 0)) {
+  if (
+    authState.accessToken &&
+    !forceRefresh &&
+    isTokenUsable(authState.accessTokenExpMs, 0)
+  ) {
     return authState.accessToken;
   }
 
@@ -454,28 +597,53 @@ async function ensureAccessToken(options = {}) {
   );
 }
 
+async function ensureAccessToken(options = {}) {
+  const { forceRefresh = false } = options;
+
+  if (!forceRefresh && isTokenUsable(authState.accessTokenExpMs)) {
+    return authState.accessToken;
+  }
+
+  if (!authState.accessTokenPromise) {
+    authState.accessTokenPromise = refreshAccessToken(forceRefresh).finally(() => {
+      authState.accessTokenPromise = null;
+    });
+  }
+
+  return authState.accessTokenPromise;
+}
+
 async function authorizedFetch(pathname, options = {}) {
   const { retryUnauthorized = true } = options;
   const accessToken = await ensureAccessToken();
-  let response = await fetch(`${API_URL}${pathname}`, {
-    headers: {
-      Accept: "application/json",
-      Authorization: `Bearer ${accessToken}`
-    }
-  });
+  let response = await performFetch(
+    `${API_URL}${pathname}`,
+    {
+      headers: {
+        Accept: "application/json",
+        Authorization: `Bearer ${accessToken}`
+      }
+    },
+    `Impossible de joindre l'API du jeu sur ${pathname}`
+  );
 
   if (response.status === 401 && retryUnauthorized && canRefreshAuth()) {
     authState.accessToken = null;
     authState.accessTokenExpMs = 0;
+    authState.accessTokenPromise = null;
 
     const refreshedToken = await ensureAccessToken({ forceRefresh: true });
 
-    response = await fetch(`${API_URL}${pathname}`, {
-      headers: {
-        Accept: "application/json",
-        Authorization: `Bearer ${refreshedToken}`
-      }
-    });
+    response = await performFetch(
+      `${API_URL}${pathname}`,
+      {
+        headers: {
+          Accept: "application/json",
+          Authorization: `Bearer ${refreshedToken}`
+        }
+      },
+      `Impossible de joindre l'API du jeu sur ${pathname}`
+    );
   }
 
   return response;
@@ -615,6 +783,292 @@ function extractLeaderboard(payload) {
       ...entry,
       rang: index + 1
     }));
+}
+
+function manhattanDistance(from, to) {
+  return Math.abs(from.coord_x - to.coord_x) + Math.abs(from.coord_y - to.coord_y);
+}
+
+function getFleetCenter(ships) {
+  if (!ships.length) {
+    return null;
+  }
+
+  const total = ships.reduce(
+    (accumulator, ship) => ({
+      x: accumulator.x + ship.coord_x,
+      y: accumulator.y + ship.coord_y
+    }),
+    { x: 0, y: 0 }
+  );
+
+  return {
+    coord_x: total.x / ships.length,
+    coord_y: total.y / ships.length
+  };
+}
+
+function getNearestPoint(origin, points) {
+  if (!points.length) {
+    return null;
+  }
+
+  return points.reduce((bestMatch, point) => {
+    const distance = manhattanDistance(origin, point);
+
+    if (!bestMatch || distance < bestMatch.distance) {
+      return {
+        point,
+        distance
+      };
+    }
+
+    return bestMatch;
+  }, null);
+}
+
+function getResourceQuantity(team, resourceName) {
+  return (
+    team.ressources.find((resource) => resource.nom === resourceName)?.quantite ?? 0
+  );
+}
+
+function getAllConstructibleTypes(planets) {
+  const seenIds = new Set();
+  const types = [];
+
+  for (const planet of planets) {
+    for (const module of planet.modules) {
+      if (
+        module.typeModule !== "CONSTRUCTION_VAISSEAUX" &&
+        module.typeModule !== "CONSTRUCTION_VAISSEAUX_AVANCEE"
+      ) {
+        continue;
+      }
+
+      for (const type of module.listeVaisseauxConstructible) {
+        const key = type.identifiant ?? type.classeVaisseau ?? type.nom;
+
+        if (!key || seenIds.has(key)) {
+          continue;
+        }
+
+        seenIds.add(key);
+        types.push(type);
+      }
+    }
+  }
+
+  return types;
+}
+
+function getShipRole(ship, context) {
+  if (ship.classeVaisseau?.includes("CARGO")) {
+    return "transport";
+  }
+
+  if (!context.hasCargo && ship.attaque > 0) {
+    return ship.nom === context.primaryMiner?.nom ? "collecte-courte" : "escorte";
+  }
+
+  return ship.attaque > 0 ? "escorte" : "reconnaissance";
+}
+
+function scoreEconomyTarget(target, context) {
+  const mineralsScore = target.planete.mineraiDisponible / 60;
+  const slotsScore = target.planete.slotsConstruction * 18;
+  const neutralityScore =
+    target.ownerStatus === "neutral" ? 90 : target.ownerStatus === "owned" ? 35 : -120;
+  const shipDistancePenalty = target.nearestShipDistance * 22;
+  const depositDistancePenalty = target.nearestDepositDistance * 14;
+  const shipCountBonus = target.nearestShipDistance <= 2 ? 30 : 0;
+  const claimBonus =
+    target.ownerStatus === "neutral" && target.planete.slotsConstruction >= 4 ? 40 : 0;
+
+  return Math.round(
+    mineralsScore +
+      slotsScore +
+      neutralityScore +
+      shipCountBonus +
+      claimBonus -
+      shipDistancePenalty -
+      depositDistancePenalty
+  );
+}
+
+function buildEconomyPlan(team, ships, cells, range) {
+  const depositPlanets = team.planetes.filter((planet) =>
+    planet.modules.some((module) => module.typeModule === "DECHARGEMENT_RESSOURCE")
+  );
+  const shipyardPlanets = team.planetes.filter((planet) =>
+    planet.modules.some(
+      (module) =>
+        module.typeModule === "CONSTRUCTION_VAISSEAUX" ||
+        module.typeModule === "CONSTRUCTION_VAISSEAUX_AVANCEE"
+    )
+  );
+  const constructibleTypes = getAllConstructibleTypes(team.planetes);
+  const fleetCenter = getFleetCenter(ships);
+  const nearestHub = fleetCenter ? getNearestPoint(fleetCenter, depositPlanets) : null;
+  const hasCargo = ships.some((ship) => ship.classeVaisseau?.includes("CARGO"));
+  const cargoTypes = constructibleTypes.filter((type) =>
+    type.classeVaisseau?.includes("CARGO")
+  );
+  const shipSlotsUsed = getResourceQuantity(team, "VAISSEAU");
+  const shipSlotCapacity = getResourceQuantity(team, "EMPLACEMENT_VAISSEAU");
+  const visiblePlanets = cells.filter(
+    (cell) => cell.planete && !cell.planete.estVide && cell.planete.mineraiDisponible > 0
+  );
+  const visibleTargets = visiblePlanets
+    .map((cell) => {
+      const nearestShip = getNearestPoint(
+        { coord_x: cell.coord_x, coord_y: cell.coord_y },
+        ships
+      );
+      const nearestDeposit = getNearestPoint(
+        { coord_x: cell.coord_x, coord_y: cell.coord_y },
+        depositPlanets
+      );
+      const ownerStatus =
+        cell.proprietaire?.identifiant === TEAM_ID
+          ? "owned"
+          : cell.proprietaire?.identifiant
+            ? "enemy"
+            : "neutral";
+      const target = {
+        identifiant: cell.planete.identifiant,
+        nom: cell.planete.nom,
+        coord_x: cell.coord_x,
+        coord_y: cell.coord_y,
+        ownerStatus,
+        mineraiDisponible: cell.planete.mineraiDisponible,
+        slotsConstruction: cell.planete.slotsConstruction,
+        pointDeVie: cell.planete.pointDeVie,
+        nearestShipDistance: nearestShip?.distance ?? 999,
+        nearestShipName: nearestShip?.point?.nom ?? null,
+        nearestDepositDistance: nearestDeposit?.distance ?? 999
+      };
+
+      return {
+        ...target,
+        score: scoreEconomyTarget(
+          {
+            ...target,
+            planete: {
+              mineraiDisponible: target.mineraiDisponible,
+              slotsConstruction: target.slotsConstruction
+            }
+          },
+          {
+            hasCargo
+          }
+        )
+      };
+    })
+    .sort((left, right) => right.score - left.score)
+    .slice(0, 8);
+  const primaryTarget = visibleTargets[0] ?? null;
+  const primaryMiner =
+    primaryTarget && ships.length
+      ? ships.find((ship) => ship.nom === primaryTarget.nearestShipName) ?? ships[0]
+      : ships[0] ?? null;
+  const fleetRoles = ships.map((ship) => ({
+    identifiant: ship.identifiant,
+    nom: ship.nom,
+    role: getShipRole(ship, {
+      hasCargo,
+      primaryMiner
+    }),
+    coord_x: ship.coord_x,
+    coord_y: ship.coord_y,
+    mineraiTransporte: ship.mineraiTransporte,
+    classeVaisseau: ship.classeVaisseau
+  }));
+  const recommendations = [];
+
+  if (primaryTarget && primaryMiner) {
+    recommendations.push({
+      priority: "high",
+      title: "Lancer la boucle de recolte courte",
+      detail: `${primaryMiner.nom} doit viser ${primaryTarget.nom} (${primaryTarget.coord_x},${primaryTarget.coord_y}) pour amorcer la collecte.`,
+      why: "C'est la cible miniere visible avec le meilleur rendement distance/ressource autour de la flotte."
+    });
+  }
+
+  if (nearestHub?.point) {
+    recommendations.push({
+      priority: "high",
+      title: "Utiliser un hub de depot fixe",
+      detail: `${nearestHub.point.nom} (${nearestHub.point.coord_x},${nearestHub.point.coord_y}) est le meilleur point de retour visible pour deposer le minerai.`,
+      why: "Cette planete possede deja un module DECHARGEMENT_RESSOURCE."
+    });
+  }
+
+  if (!hasCargo && cargoTypes.length && shipyardPlanets.length) {
+    const cargoLabel = cargoTypes[0].classeVaisseau ?? cargoTypes[0].nom ?? "cargo";
+    recommendations.push({
+      priority: "high",
+      title: "Objectif de reconstruction",
+      detail: `Des que la premiere boucle rapporte assez, construis un ${cargoLabel} sur ${shipyardPlanets[0].nom}.`,
+      why: "Sans cargo, ta boucle eco reste lente et immobilise tes chasseurs."
+    });
+  }
+
+  if (shipSlotCapacity > 0 && shipSlotsUsed >= shipSlotCapacity) {
+    recommendations.push({
+      priority: "medium",
+      title: "Saturation de flotte",
+      detail: "Tes emplacements vaisseaux sont pleins.",
+      why: "Verifier rapidement si un depot, module ou regle peut augmenter la capacite avant de relancer la production."
+    });
+  } else if (shipSlotCapacity > 0) {
+    recommendations.push({
+      priority: "medium",
+      title: "Capacite de production",
+      detail: `${shipSlotsUsed}/${shipSlotCapacity} emplacements vaisseaux utilises.`,
+      why: "Tu as encore de la marge pour transformer du minerai en nouveaux vaisseaux."
+    });
+  }
+
+  if (primaryTarget?.ownerStatus === "neutral" && primaryTarget.slotsConstruction >= 4) {
+    recommendations.push({
+      priority: "medium",
+      title: "Conquete apres premiere rotation",
+      detail: `${primaryTarget.nom} cumule minerai et slots. Teste CONQUERIR apres avoir securise un premier depot.`,
+      why: "Cela ouvre un two-step rentable: points de claim puis nouvelle base de production."
+    });
+  }
+
+  return {
+    summary: {
+      points: getResourceQuantity(team, "POINT"),
+      credits: getResourceQuantity(team, "CREDIT"),
+      minerai: getResourceQuantity(team, "MINERAI"),
+      shipSlotsUsed,
+      shipSlotCapacity,
+      hasCargo,
+      canDeposit: depositPlanets.length > 0,
+      canBuildShips: shipyardPlanets.length > 0,
+      canBuildCargo: cargoTypes.length > 0
+    },
+    range,
+    hubs: depositPlanets.map((planet) => ({
+      identifiant: planet.identifiant,
+      nom: planet.nom,
+      coord_x: planet.coord_x,
+      coord_y: planet.coord_y
+    })),
+    shipyards: shipyardPlanets.map((planet) => ({
+      identifiant: planet.identifiant,
+      nom: planet.nom,
+      coord_x: planet.coord_x,
+      coord_y: planet.coord_y,
+      constructibleTypes: getAllConstructibleTypes([planet])
+    })),
+    fleetRoles,
+    visibleTargets,
+    recommendations
+  };
 }
 
 function computeRangeFromShips(ships) {
@@ -798,6 +1252,8 @@ app.get("/api/map", ensureConfig, async (req, res, next) => {
 
 app.get("/api/state", ensureConfig, async (req, res, next) => {
   try {
+    const teamPayload = await apiGet(`/equipes/${TEAM_ID}`);
+    const team = normalizeTeam(teamPayload);
     const shipsPayload = await apiGet(`/equipes/${TEAM_ID}/vaisseaux`);
     const ships = extractArray(shipsPayload)
       .map(normalizeShip)
@@ -811,14 +1267,48 @@ app.get("/api/state", ensureConfig, async (req, res, next) => {
     const cells = extractArray(mapPayload)
       .map(normalizeCell)
       .filter(Boolean);
+    const economyPlan = buildEconomyPlan(team, ships, cells, {
+      x: xRange,
+      y: yRange
+    });
 
     res.json({
       fetchedAt: new Date().toISOString(),
       mapSize: MAP_SIZE,
       teamId: TEAM_ID,
+      team,
       range: { x: xRange, y: yRange },
       ships,
-      cells
+      cells,
+      economyPlan
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/strategy/economy", ensureConfig, async (req, res, next) => {
+  try {
+    const team = normalizeTeam(await apiGet(`/equipes/${TEAM_ID}`));
+    const ships = extractArray(await apiGet(`/equipes/${TEAM_ID}/vaisseaux`))
+      .map(normalizeShip)
+      .filter(Boolean);
+    const suggestedRange = computeRangeFromShips(ships);
+    const xRange = parseRange(req.query.x_range, suggestedRange.x);
+    const yRange = parseRange(req.query.y_range, suggestedRange.y);
+    const cells = extractArray(
+      await apiGet(`/monde/map?x_range=${xRange.join(",")}&y_range=${yRange.join(",")}`)
+    )
+      .map(normalizeCell)
+      .filter(Boolean);
+
+    res.json({
+      fetchedAt: new Date().toISOString(),
+      teamId: TEAM_ID,
+      economyPlan: buildEconomyPlan(team, ships, cells, {
+        x: xRange,
+        y: yRange
+      })
     });
   } catch (error) {
     next(error);
