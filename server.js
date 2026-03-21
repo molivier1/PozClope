@@ -717,7 +717,7 @@ function normalizeLeaderboardEntry(entry, index) {
     return null;
   }
 
-  const score = Number(
+  let score = Number(
     pickNestedValue(entry, [
       "score",
       "points",
@@ -729,6 +729,14 @@ function normalizeLeaderboardEntry(entry, index) {
       "victoryPoints"
     ])
   );
+
+  // Fallback if score wasn't found directly (Number(null) === 0)
+  if ((!Number.isFinite(score) || score === 0) && Array.isArray(entry.ressources)) {
+    const pointRes = entry.ressources.find(r => r.ressource?.nom === "POINT");
+    if (pointRes && pointRes.quantite !== undefined) {
+      score = Number(pointRes.quantite);
+    }
+  }
 
   if (!Number.isFinite(score)) {
     return null;
@@ -1160,18 +1168,8 @@ async function fetchLeaderboard() {
       continue;
     }
 
-    const leaderboard = result.payload
-      .filter(entry => entry.idEquipe)
-      .map(entry => ({
-        nom: entry.nom,
-        type: entry.type,
-        score: getScore(entry)
-      }))
-      .sort((a, b) => b.score - a.score)
-      .map((entry, index) => ({
-        rang: index + 1,
-        ...entry
-      }));
+    // Use the robust extraction function instead of manual mapping
+    const leaderboard = extractLeaderboard(result.payload);
 
     if (leaderboard.length) {
       cachedLeaderboardPath = pathname;
@@ -1222,17 +1220,61 @@ function ensureConfig(req, res, next) {
 
 app.use(express.static(PUBLIC_DIR));
 
-app.get("/api/health", (req, res) => {
-  res.json({
+app.get("/api/health", async (req, res) => {
+  const missing = missingConfig();
+  const health = {
     ok: true,
     mapSize: MAP_SIZE,
-    envLoadedFrom: ENV_PATHS.find((envPath) => fs.existsSync(envPath)) ?? null,
-    authMode: getAuthMode(),
-    tokenExpiresAt:
-      authState.accessTokenExpMs > 0
-        ? new Date(authState.accessTokenExpMs).toISOString()
-        : null
-  });
+    backend: {
+      status: "running",
+      port: PORT,
+      envLoadedFrom: ENV_PATHS.find((envPath) => fs.existsSync(envPath)) ?? null,
+      authMode: getAuthMode(),
+      tokenExpiresAt:
+        authState.accessTokenExpMs > 0
+          ? new Date(authState.accessTokenExpMs).toISOString()
+          : null
+    },
+    config: {
+      complete: missing.length === 0,
+      missing: missing
+    },
+    gameAPI: {
+      url: API_URL,
+      status: "unknown"
+    }
+  };
+
+  // Try to reach game API
+  if (!missing.length) {
+    try {
+      const testRes = await fetch(`${API_URL}/equipes/${TEAM_ID}/vaisseaux`, {
+        headers: {
+          Authorization: `Bearer ${authState.accessToken || ""}`,
+          Accept: "application/json"
+        }
+      });
+      
+      if (testRes.ok) {
+        health.gameAPI.status = "reachable";
+      } else if (testRes.status === 401) {
+        health.gameAPI.status = "unauthorized";
+        health.gameAPI.errorCode = 401;
+        health.gameAPI.hint = "Token invalid or expired. The backend will try to refresh it.";
+      } else {
+        health.gameAPI.status = "error";
+        health.gameAPI.errorCode = testRes.status;
+        const text = await testRes.text();
+        health.gameAPI.errorMessage = text.substring(0, 200);
+      }
+    } catch (err) {
+      health.gameAPI.status = "unreachable";
+      health.gameAPI.error = err.message;
+      health.gameAPI.hint = "Cannot connect to " + API_URL + ". Check network connectivity or if the game API server is running.";
+    }
+  }
+
+  res.json(health);
 });
 
 app.get("/api/ships", ensureConfig, async (req, res, next) => {
@@ -1356,10 +1398,27 @@ app.get(/^\/(?!api\/).*/, (req, res) => {
 
 app.use((error, req, res, next) => {
   const status = Number.isInteger(error.status) ? error.status : 500;
+  
+  // Log the full error for debugging
+  console.error(`[${new Date().toISOString()}] ${status} Error on ${req.method} ${req.path}:`, error.message);
 
-  res.status(status).json({
-    error: error.message || "Erreur interne"
-  });
+  const responseBody = {
+    error: error.message || "Erreur interne",
+    status: status,
+    path: req.path,
+    timestamp: new Date().toISOString()
+  };
+
+  // Add helpful hints for common errors
+  if (status === 502) {
+    responseBody.hint = "Backend cannot reach the game API. Check if http://37.187.156.222:8080 is accessible";
+  } else if (status === 401) {
+    responseBody.hint = "Invalid API token. Update TOKEN in Backend/.env";
+  } else if (status === 404) {
+    responseBody.hint = "API endpoint not found";
+  }
+
+  res.status(status).json(responseBody);
 });
 
 app.listen(PORT, () => {
