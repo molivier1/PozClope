@@ -1,13 +1,18 @@
 import { getFullMap } from './getFullMap.js';
 import { getEquipes } from './getEquipes.js';
 import { getAllVaisseaux } from './getAllVaisseaux.js';
+import fs from 'fs'
 
 async function main() {
   /*
   getMap*/
   try {
     const map = await getFullMap(58, 18);
-    console.log("Map complète :", JSON.stringify(map, null, 2));
+    //console.log("Map complète :", JSON.stringify(map, null, 2));
+    const text = map.map(obj => JSON.stringify(obj, null, 2)).join('\n');
+
+    fs.writeFileSync('mapSnapshot.txt', text, { encoding: 'utf8' });
+
   } catch (err) {
     console.error("Erreur :", err.message);
   }
