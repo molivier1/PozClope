@@ -400,6 +400,32 @@ function normalizeTeam(team) {
   };
 }
 
+function normalizeShipName(value) {
+  return String(value ?? "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+}
+
+function getActiveShipNameSet(teamPayload) {
+  return new Set(
+    extractArray(teamPayload?.vaisseaux)
+      .map((ship) => ship?.nom)
+      .filter(Boolean)
+      .map((name) => normalizeShipName(name))
+  );
+}
+
+function filterActiveShips(ships, teamPayload) {
+  const activeNames = getActiveShipNameSet(teamPayload);
+
+  if (activeNames.size === 0) {
+    return ships;
+  }
+
+  return ships.filter((ship) => activeNames.has(normalizeShipName(ship.nom)));
+}
+
 function isTokenUsable(expiresAtMs, skewMs = TOKEN_REFRESH_SKEW_MS) {
   return Number.isFinite(expiresAtMs) && expiresAtMs - Date.now() > skewMs;
 }
@@ -1279,10 +1305,14 @@ app.get("/api/health", async (req, res) => {
 
 app.get("/api/ships", ensureConfig, async (req, res, next) => {
   try {
+    const teamPayload = await apiGet(`/equipes/${TEAM_ID}`);
     const payload = await apiGet(`/equipes/${TEAM_ID}/vaisseaux`);
-    const ships = extractArray(payload)
+    const ships = filterActiveShips(
+      extractArray(payload)
       .map(normalizeShip)
-      .filter(Boolean);
+      .filter(Boolean),
+      teamPayload
+    );
 
     res.json({
       teamId: TEAM_ID,
@@ -1318,9 +1348,12 @@ app.get("/api/state", ensureConfig, async (req, res, next) => {
     const teamPayload = await apiGet(`/equipes/${TEAM_ID}`);
     const team = normalizeTeam(teamPayload);
     const shipsPayload = await apiGet(`/equipes/${TEAM_ID}/vaisseaux`);
-    const ships = extractArray(shipsPayload)
+    const ships = filterActiveShips(
+      extractArray(shipsPayload)
       .map(normalizeShip)
-      .filter(Boolean);
+      .filter(Boolean),
+      teamPayload
+    );
     const suggestedRange = computeRangeFromShips(ships);
     const xRange = parseRange(req.query.x_range, suggestedRange.x);
     const yRange = parseRange(req.query.y_range, suggestedRange.y);
@@ -1352,10 +1385,14 @@ app.get("/api/state", ensureConfig, async (req, res, next) => {
 
 app.get("/api/strategy/economy", ensureConfig, async (req, res, next) => {
   try {
-    const team = normalizeTeam(await apiGet(`/equipes/${TEAM_ID}`));
-    const ships = extractArray(await apiGet(`/equipes/${TEAM_ID}/vaisseaux`))
+    const teamPayload = await apiGet(`/equipes/${TEAM_ID}`);
+    const team = normalizeTeam(teamPayload);
+    const ships = filterActiveShips(
+      extractArray(await apiGet(`/equipes/${TEAM_ID}/vaisseaux`))
       .map(normalizeShip)
-      .filter(Boolean);
+      .filter(Boolean),
+      teamPayload
+    );
     const suggestedRange = computeRangeFromShips(ships);
     const xRange = parseRange(req.query.x_range, suggestedRange.x);
     const yRange = parseRange(req.query.y_range, suggestedRange.y);
