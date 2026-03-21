@@ -53,6 +53,47 @@ const ShipImage = ({ ship }) => {
   );
 };
 
+const PlanetImage = ({ planet }) => {
+  const [errorLevel, setErrorLevel] = useState(0);
+
+  useEffect(() => {
+    setErrorLevel(0);
+  }, [planet.category, planet.biome]);
+
+  const safeBiome = planet.biome ? planet.biome.replace(/\s+/g, '_') : 'terre';
+  const capitalBiome = safeBiome.charAt(0).toUpperCase() + safeBiome.slice(1);
+  const category = planet.category || 'tellurique';
+  const capitalCategory = category.charAt(0).toUpperCase() + category.slice(1);
+
+  const sources = [
+    `/assets/assets 2d/planets/${category}/${safeBiome}.svg`,
+    `/assets/assets 2d/planets/${category}/${safeBiome}.png`,
+    `/assets/assets 2d/planets/${capitalCategory}/${capitalBiome}.svg`,
+    `/assets/assets 2d/planets/${capitalCategory}/${capitalBiome}.png`,
+    `/assets/assets 2d/planets/${safeBiome}.svg`,
+    `/assets/assets 2d/planets/${safeBiome}.png`
+  ];
+
+  if (errorLevel >= sources.length) {
+    return (
+      <div
+        style={{ width: '30px', height: '30px', backgroundColor: category === 'gazeuse' ? '#a342f5' : '#42f5aa', borderRadius: '50%', boxShadow: '0 0 10px currentColor', position: 'absolute', zIndex: 15 }}
+        title={planet.name}
+      />
+    );
+  }
+
+  return (
+    <img
+      src={sources[errorLevel]}
+      className="asset-img planet-glow"
+      style={{ width: '80%', position: 'absolute', zIndex: 15 }}
+      alt={planet.name}
+      onError={() => setErrorLevel(prev => prev + 1)}
+    />
+  );
+};
+
 function App() {
   const [ships, setShips] = useState([]);
   const [planets, setPlanets] = useState([]);
@@ -92,8 +133,12 @@ function App() {
             x: cell.coord_x,
             y: cell.coord_y,
             name: cell.planete.nom,
-            category: cell.planete.typePlanete === 'GAZEUSE' ? 'gazeuse' : 'tellurique',
-            biome: cell.planete.biome ? cell.planete.biome.toLowerCase() : 'terre'
+            category: (cell.planete.typePlanete || cell.planete.modelePlanete?.typePlanete) === 'GAZEUSE' ? 'gazeuse' : 'tellurique',
+            biome: (cell.planete.biome || cell.planete.modelePlanete?.biome || 'terre').toLowerCase(),
+            hp: cell.planete.pointDeVie,
+            minerals: cell.planete.mineraiDisponible,
+            owner: cell.proprietaire ? cell.proprietaire.nom : 'UNCLAIMED',
+            slots: cell.planete.slotsConstruction
           })));
       }
 
@@ -146,8 +191,8 @@ function App() {
   }, [ships, planets]);
 
   // Pixel coordinates for the Fog of War hole
-  const holeX = ships[0] ? (ships[0].x * BASE_CELL_SIZE + 25) : 0;
-  const holeY = ships[0] ? (ships[0].y * BASE_CELL_SIZE + 25) : 0;
+  const holeX = ships[0] ? (ships[0].x * BASE_CELL_SIZE + 25) : (FULL_MAP * BASE_CELL_SIZE / 2);
+  const holeY = ships[0] ? (ships[0].y * BASE_CELL_SIZE + 25) : (FULL_MAP * BASE_CELL_SIZE / 2);
 
   if (loading) return <div className="loading">CONNECTING...</div>;
 
@@ -169,12 +214,7 @@ function App() {
 
           return (
             <div key={i} className="cell" onClick={() => setSelected(ship || planet)}>
-              {planet && (
-                <img 
-                  src={`/assets/assets 2d/planets/${planet.category}/${planet.biome}.svg`} 
-                  className="asset-img planet-glow" 
-                />
-              )}
+              {planet && <PlanetImage planet={planet} />}
               {ship && <ShipImage ship={ship} />}
             </div>
           );
@@ -186,6 +226,28 @@ function App() {
       <div className="hud-panel glass-tech hud-top-left">
         <div className="glitch-text label-tiny">// LIVE_DATA_LINK</div>
         <div className="flex-between"><span>SHIPS ACTIVE</span><span className="value-neon">{ships.length}</span></div>
+
+        {ships.length > 0 && (
+          <div className="flex-col" style={{ marginTop: '15px', gap: '6px', maxHeight: '50vh', overflowY: 'auto', paddingRight: '4px' }}>
+            <div className="glitch-text label-tiny">// FLEET_ROSTER</div>
+            {ships.map((ship, idx) => {
+              const planetOn = planets.find(p => p.x === ship.x && p.y === ship.y);
+              return (
+                <div key={idx} className="mini-row flex-col" style={{ alignItems: 'flex-start', cursor: 'pointer' }} onClick={() => setSelected(ship)}>
+                  <div className="flex-between w-full">
+                    <span style={{ color: '#fff', fontWeight: 'bold', fontSize: '11px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: '140px' }}>{ship.id}</span>
+                    <span className="value-neon" style={{ fontSize: '10px' }}>[{ship.x}:{ship.y}]</span>
+                  </div>
+                  {planetOn && (
+                    <span style={{ fontSize: '9px', color: 'var(--accent)', marginTop: '2px', textTransform: 'uppercase' }}>
+                      ⮡ ON {planetOn.name}
+                    </span>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
       </div>
 
       {/* LEADERBOARD HUD */}
@@ -250,6 +312,27 @@ function App() {
                 <div className="mini-row">
                   <span>CARGO</span>
                   <span style={{ color: '#fff' }}>{selected.cargo}</span>
+                </div>
+              )}
+
+              {selected.minerals !== undefined && (
+                <div className="mini-row">
+                  <span>MINERALS</span>
+                  <span style={{ color: '#fff' }}>{selected.minerals}</span>
+                </div>
+              )}
+
+              {selected.slots !== undefined && (
+                <div className="mini-row">
+                  <span>SLOTS</span>
+                  <span style={{ color: '#fff' }}>{selected.slots}</span>
+                </div>
+              )}
+
+              {selected.owner && (
+                <div className="mini-row">
+                  <span>OWNER</span>
+                  <span style={{ color: '#fff', textTransform: 'uppercase' }}>{selected.owner}</span>
                 </div>
               )}
 
