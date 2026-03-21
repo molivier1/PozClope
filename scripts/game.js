@@ -345,8 +345,12 @@ function normalizeShip(ship) {
 }
 
 async function getShips() {
-  const ships = await apiGet(`/equipes/${TEAM_ID}/vaisseaux`);
-  return Array.isArray(ships) ? ships.map(normalizeShip) : [];
+  const [teamPayload, shipsPayload] = await Promise.all([
+    getTeam(),
+    apiGet(`/equipes/${TEAM_ID}/vaisseaux`)
+  ]);
+  const ships = Array.isArray(shipsPayload) ? shipsPayload.map(normalizeShip) : [];
+  return filterActiveShips(ships, teamPayload);
 }
 
 async function getTeam() {
@@ -571,6 +575,12 @@ function findBuildPlanet(team, acceptedModules) {
   return null;
 }
 
+function findConstructibleType(team, shipClass) {
+  return getConstructibleShipTypes(team).find(
+    (type) => type.classeVaisseau === shipClass
+  ) ?? null;
+}
+
 function findPlanetByName(team, planetName) {
   if (!planetName) {
     return null;
@@ -602,11 +612,15 @@ function printUsage() {
   console.log("npm.cmd run game -- cell 5 40");
   console.log("npm.cmd run game -- build-options");
   console.log('npm.cmd run game -- buy-offer "uuid-offre"');
+  console.log('npm.cmd run game -- buy-plan CHASSEUR_MOYEN');
+  console.log('npm.cmd run game -- build-ship CHASSEUR_MOYEN "Chasseur M 1"');
   console.log('npm.cmd run game -- buy-cargo-plan');
+  console.log('npm.cmd run game -- buy-fighter-plan');
   console.log('npm.cmd run game -- buy-advanced-yard');
   console.log('npm.cmd run game -- place-advanced-yard "Nom Planete"');
   console.log('npm.cmd run game -- buy-cargo-medium-plan');
   console.log('npm.cmd run game -- build-cargo "Cargo 1"');
+  console.log('npm.cmd run game -- build-fighter "Chasseur 2"');
   console.log('npm.cmd run game -- build-cargo-medium "Cargo M 1"');
   console.log('npm.cmd run game -- move "Chasseur leger 0" 6 40');
   console.log('npm.cmd run game -- harvest "Chasseur leger 0" 6 40');
@@ -685,6 +699,25 @@ function normalizeText(value) {
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
     .toLowerCase();
+}
+
+function getActiveShipNameSet(teamPayload) {
+  const names = extractArray(teamPayload?.vaisseaux)
+    .map((ship) => ship?.nom)
+    .filter(Boolean)
+    .map((name) => normalizeText(name));
+
+  return new Set(names);
+}
+
+function filterActiveShips(ships, teamPayload) {
+  const activeNames = getActiveShipNameSet(teamPayload);
+
+  if (activeNames.size === 0) {
+    return ships;
+  }
+
+  return ships.filter((ship) => activeNames.has(normalizeText(ship.nom)));
 }
 
 async function findShipByName(name) {
@@ -807,6 +840,69 @@ async function run() {
     return;
   }
 
+  if (command === "build-fighter") {
+    const team = await getTeamState();
+    const constructibleFighter = getConstructibleShipTypes(team).find(
+      (type) => type.classeVaisseau === "CHASSEUR_LEGER"
+    );
+
+    if (!constructibleFighter) {
+      fail("Aucun CHASSEUR_LEGER constructible trouve.");
+    }
+
+    const marketTypes = extractMarketShipTypes(await getMarketOffers());
+    const fighterType = marketTypes.get("CHASSEUR_LEGER");
+
+    if (!fighterType) {
+      fail("Impossible de resoudre le vrai type.id du CHASSEUR_LEGER.");
+    }
+
+    const shipNameToBuild = shipName || `Chasseur ${Date.now()}`;
+    console.log(
+      `Construction de ${shipNameToBuild} sur ${constructibleFighter.planeteNom} (${fighterType.classeVaisseau})`
+    );
+    const result = await buildShip(
+      shipNameToBuild,
+      fighterType.identifiant,
+      constructibleFighter.planeteIdentifiant
+    );
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+
+  if (command === "build-ship") {
+    if (!shipName) {
+      fail("Il faut fournir une classe de vaisseau. Exemple: build-ship CHASSEUR_MOYEN \"Nom\"");
+    }
+
+    const shipClass = String(shipName).toUpperCase();
+    const customName = y ? [x, y].filter(Boolean).join(" ") : x;
+    const [team, plans] = await Promise.all([getTeamState(), getPlans()]);
+    const constructibleType = findConstructibleType(team, shipClass);
+
+    if (!constructibleType) {
+      fail(`Aucun ${shipClass} constructible trouve sur vos planetes.`);
+    }
+
+    const buildType = resolveBuildTypeIdFromPlans(plans, shipClass);
+
+    if (!buildType?.typeId) {
+      fail(`Vous ne possedez pas de plan ${shipClass}.`);
+    }
+
+    const shipNameToBuild = customName || `${shipClass}-${Date.now()}`;
+    console.log(
+      `Construction de ${shipNameToBuild} sur ${constructibleType.planeteNom} (${shipClass})`
+    );
+    const result = await buildShip(
+      shipNameToBuild,
+      buildType.typeId,
+      constructibleType.planeteIdentifiant
+    );
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+
   if (command === "buy-advanced-yard") {
     const offers = await getMarketOffers();
     const moduleOffer = findCheapestModuleOffer(
@@ -906,6 +1002,27 @@ async function run() {
     return;
   }
 
+  if (command === "buy-plan") {
+    if (!shipName) {
+      fail("Il faut fournir une classe de vaisseau. Exemple: buy-plan CHASSEUR_MOYEN");
+    }
+
+    const shipClass = String(shipName).toUpperCase();
+    const offers = await getMarketOffers();
+    const planOffer = findCheapestPlanOffer(offers, shipClass);
+
+    if (!planOffer?.offerId) {
+      fail(`Aucune offre de plan ${shipClass} ouverte sur le marche.`);
+    }
+
+    console.log(
+      `Achat du plan ${shipClass} ${planOffer.offerId} pour ${planOffer.prix} credits`
+    );
+    const result = await buyOffer(planOffer.offerId);
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+
   if (command === "buy-cargo-plan") {
     const offers = await getMarketOffers();
     const cargoOffer = extractArray(offers).find((offer) => {
@@ -927,6 +1044,22 @@ async function run() {
       `Achat du plan cargo ${cargoOffer.idOffre} pour ${cargoOffer.prix} credits`
     );
     const result = await buyOffer(cargoOffer.idOffre);
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+
+  if (command === "buy-fighter-plan") {
+    const offers = await getMarketOffers();
+    const fighterOffer = findCheapestPlanOffer(offers, "CHASSEUR_LEGER");
+
+    if (!fighterOffer?.offerId) {
+      fail("Aucune offre de plan CHASSEUR_LEGER ouverte sur le marche.");
+    }
+
+    console.log(
+      `Achat du plan chasseur ${fighterOffer.offerId} pour ${fighterOffer.prix} credits`
+    );
+    const result = await buyOffer(fighterOffer.offerId);
     console.log(JSON.stringify(result, null, 2));
     return;
   }

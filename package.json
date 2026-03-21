@@ -11,6 +11,7 @@
     "test:harvest-loop": "node scripts/test-harvest-loop.js",
     "game": "node scripts/game.js",
     "getmodel": "node scripts/getmodel.js",
+    "siege": "node scripts/siege.js",
     "farm": "node scripts/farm.js",
     "farm-cargos": "node scripts/farm-cargos.js"
   },
