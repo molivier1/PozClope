@@ -56,13 +56,6 @@ body { margin: 0; background: var(--bg); color: var(--accent); font-family: 'Jet
   inset: 0;
   pointer-events: none;
   z-index: 5;
-  background: radial-gradient(
-    circle 450px at var(--hole-x) var(--hole-y), 
-    rgba(255, 0, 255, 0.15) 0%,   /* Bright magenta glow right on the ship */
-    transparent 25%,              /* Fully clear inner viewing area */
-    rgba(0, 0, 0, 0.85) 65%,      /* Starts getting dark */
-    rgba(0, 0, 0, 0.98) 100%      /* Pitch black edges */
-  );
 }
 
 .map-canvas {

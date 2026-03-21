@@ -102,6 +102,7 @@ function App() {
   const [viewport, setViewport] = useState({ x: 0, y: 0 });
   const [selected, setSelected] = useState(null);
   const [leaderboard, setLeaderboard] = useState([]);
+  const [showPlanets, setShowPlanets] = useState(false);
 
   const fetchData = async () => {
     try {
@@ -151,7 +152,8 @@ function App() {
               hp: Number(p.pointDeVie || 0),
               minerals: Number(p.mineraiDisponible || 0),
               owner: stateData.team.nom || "ME",
-              slots: Number(p.slotsConstruction || 0)
+              slots: Number(p.slotsConstruction || 0),
+              isMine: true
             });
           }
         });
@@ -164,15 +166,21 @@ function App() {
             const x = Number(cell.coord_x ?? cell.x);
             const y = Number(cell.coord_y ?? cell.y);
             if (!Number.isNaN(x) && !Number.isNaN(y)) {
+              const wasMine = allPlanetsMap.get(`${x},${y}`)?.isMine;
+              const isMineNow = (cell.proprietaire?.identifiant && String(cell.proprietaire.identifiant) === String(stateData.teamId)) ||
+                                (stateData.team && cell.proprietaire?.nom === stateData.team.nom) ||
+                                wasMine;
+
               allPlanetsMap.set(`${x},${y}`, {
                 x, y,
                 name: cell.planete.nom || "Inconnue",
-                category: (cell.planete.typePlanete || cell.planete.modelePlanete?.typePlanete) === 'GAZEUSE' ? 'gazeuse' : 'tellurique',
+                category: String(cell.planete.typePlanete || cell.planete.modelePlanete?.typePlanete).toUpperCase() === 'GAZEUSE' ? 'gazeuse' : 'tellurique',
                 biome: (cell.planete.biome || cell.planete.modelePlanete?.biome || 'terre').toLowerCase(),
                 hp: Number(cell.planete.pointDeVie ?? 0),
                 minerals: Number(cell.planete.mineraiDisponible ?? 0),
                 owner: cell.proprietaire ? cell.proprietaire.nom : 'UNCLAIMED',
-                slots: Number(cell.planete.slotsConstruction ?? 0)
+                slots: Number(cell.planete.slotsConstruction ?? 0),
+                isMine: isMineNow
               });
             }
           }
@@ -237,10 +245,6 @@ function App() {
     }
   }, [ships, planets]);
 
-  // Pixel coordinates for the Fog of War hole
-  const holeX = ships[0] ? (ships[0].x * BASE_CELL_SIZE + 25) : (FULL_MAP * BASE_CELL_SIZE / 2);
-  const holeY = ships[0] ? (ships[0].y * BASE_CELL_SIZE + 25) : (FULL_MAP * BASE_CELL_SIZE / 2);
-  
   // Gestion du Drag & Drop de la carte
   const [isDragging, setIsDragging] = useState(false);
   const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
@@ -256,17 +260,20 @@ function App() {
     }
   };
 
+  const handleWheel = (e) => {
+    const zoomAmount = e.deltaY > 0 ? -0.1 : 0.1;
+    setZoom((prevZoom) => Math.min(Math.max(0.3, prevZoom + zoomAmount), 3));
+  };
+
   if (loading) return <div className="loading">CONNECTING...</div>;
 
   return (
-    <div className="game-container" onMouseDown={handleMouseDown} onMouseMove={handleMouseMove} onMouseUp={() => setIsDragging(false)} onMouseLeave={() => setIsDragging(false)}>
+    <div className="game-container" onWheel={handleWheel} onMouseDown={handleMouseDown} onMouseMove={handleMouseMove} onMouseUp={() => setIsDragging(false)} onMouseLeave={() => setIsDragging(false)}>
       <div
         className="map-canvas"
         style={{
           transform: `translate(${viewport.x}px, ${viewport.y}px) scale(${zoom})`,
-          cursor: isDragging ? 'grabbing' : 'grab',
-          '--hole-x': `${holeX}px`,
-          '--hole-y': `${holeY}px`
+          cursor: isDragging ? 'grabbing' : 'grab'
         }}
       >
         {[...Array(FULL_MAP * FULL_MAP)].map((_, i) => {
@@ -283,15 +290,53 @@ function App() {
           );
         })}
         {/* Fog layer is inside the canvas so it scales with everything */}
-        <div className="fow-overlay" />
+        <div className="fow-overlay">
+          <svg width={FULL_MAP * BASE_CELL_SIZE} height={FULL_MAP * BASE_CELL_SIZE} style={{ position: 'absolute', left: 0, top: 0, pointerEvents: 'none' }}>
+            <defs>
+              <radialGradient id="fog-hole">
+                <stop offset="25%" stopColor="black" />
+                <stop offset="65%" stopColor="rgba(128,128,128, 1)" />
+                <stop offset="100%" stopColor="white" />
+              </radialGradient>
+              <radialGradient id="fog-glow">
+                <stop offset="0%" stopColor="rgba(255, 0, 255, 0.15)" />
+                <stop offset="25%" stopColor="transparent" />
+              </radialGradient>
+              <mask id="fog-mask">
+                <rect width="100%" height="100%" fill="white" />
+                {ships.map((s, i) => (
+                  <circle 
+                    key={i} 
+                    cx={s.x * BASE_CELL_SIZE + (BASE_CELL_SIZE / 2)} 
+                    cy={s.y * BASE_CELL_SIZE + (BASE_CELL_SIZE / 2)} 
+                    r="450" 
+                    fill="url(#fog-hole)" 
+                    style={{ mixBlendMode: 'multiply' }} 
+                  />
+                ))}
+              </mask>
+            </defs>
+            <rect width="100%" height="100%" fill="rgba(0, 0, 0, 0.75)" mask="url(#fog-mask)" />
+            {ships.map((s, i) => (
+              <circle 
+                key={`glow-${i}`} 
+                cx={s.x * BASE_CELL_SIZE + (BASE_CELL_SIZE / 2)} 
+                cy={s.y * BASE_CELL_SIZE + (BASE_CELL_SIZE / 2)} 
+                r="450" 
+                fill="url(#fog-glow)" 
+              />
+            ))}
+          </svg>
+        </div>
       </div>
 
       <div className="hud-panel glass-tech hud-top-left">
         <div className="glitch-text label-tiny">// LIVE_DATA_LINK</div>
         <div className="flex-between"><span>SHIPS ACTIVE</span><span className="value-neon">{ships.length}</span></div>
+        <div className="flex-between" style={{ marginTop: '4px' }}><span>PLANETS OWNED</span><span className="value-neon">{planets.filter(p => p.isMine).length}</span></div>
 
         {ships.length > 0 && (
-          <div className="flex-col" style={{ marginTop: '15px', gap: '6px', maxHeight: '50vh', overflowY: 'auto', paddingRight: '4px' }}>
+          <div className="flex-col" style={{ marginTop: '15px', gap: '6px', maxHeight: '35vh', overflowY: 'auto', paddingRight: '4px' }}>
             <div className="glitch-text label-tiny">// FLEET_ROSTER</div>
             {ships.map((ship, idx) => {
               const planetOn = planets.find(p => p.x === ship.x && p.y === ship.y);
@@ -309,6 +354,30 @@ function App() {
                 </div>
               );
             })}
+          </div>
+        )}
+
+        {planets.filter(p => p.isMine).length > 0 && (
+          <div className="flex-col" style={{ marginTop: '15px', gap: '6px', maxHeight: '35vh', overflowY: 'auto', paddingRight: '4px' }}>
+            <div 
+              className="glitch-text label-tiny flex-between" 
+              style={{ cursor: 'pointer' }} 
+              onClick={() => setShowPlanets(!showPlanets)}
+            >
+              <span>// PLANETARY_BASES</span>
+              <span>{showPlanets ? '[-]' : '[+]'}</span>
+            </div>
+            {showPlanets && planets.filter(p => p.isMine).map((planet, idx) => (
+              <div key={`p-${idx}`} className="mini-row flex-col" style={{ alignItems: 'flex-start', cursor: 'pointer' }} onClick={() => setSelected(planet)}>
+                <div className="flex-between w-full">
+                  <span style={{ color: '#fff', fontWeight: 'bold', fontSize: '11px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: '140px' }}>{planet.name}</span>
+                  <span className="value-neon" style={{ fontSize: '10px' }}>[{planet.x}:{planet.y}]</span>
+                </div>
+                <span style={{ fontSize: '9px', color: 'var(--accent)', marginTop: '2px', textTransform: 'uppercase' }}>
+                  SLOTS: {planet.slots} | MIN: {planet.minerals}
+                </span>
+              </div>
+            ))}
           </div>
         )}
       </div>

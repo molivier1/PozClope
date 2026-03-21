@@ -67,6 +67,40 @@ const authState = {
   accessTokenPromise: null
 };
 
+let cachedFullMap = [];
+let isFetchingMap = false;
+
+async function refreshFullMap() {
+  if (isFetchingMap || !API_URL) return;
+  isFetchingMap = true;
+  try {
+    const chunkSize = 18;
+    const fullMap = [];
+    for (let y = 0; y < MAP_SIZE; y += chunkSize) {
+      for (let x = 0; x < MAP_SIZE; x += chunkSize) {
+        const xEnd = Math.min(x + chunkSize - 1, MAP_SIZE - 1);
+        const yEnd = Math.min(y + chunkSize - 1, MAP_SIZE - 1);
+        const response = await authorizedFetch(`/monde/map?x_range=${x},${xEnd}&y_range=${y},${yEnd}`);
+        if (response.ok) {
+          const payload = await response.json();
+          fullMap.push(...extractArray(payload));
+        }
+      }
+    }
+    if (fullMap.length > 0) {
+      cachedFullMap = fullMap.map(normalizeCell).filter(Boolean);
+    }
+  } catch (err) {
+    console.error("Map chunk refresh failed:", err.message);
+  } finally {
+    isFetchingMap = false;
+  }
+}
+
+// Cache the full map in the background to avoid Game API timeouts on large ranges
+setTimeout(refreshFullMap, 2000);
+setInterval(refreshFullMap, 60000);
+
 function getScore(entry) {
   if (!entry.ressources) return 0;
 
@@ -244,7 +278,8 @@ function normalizePlanet(planet) {
     return null;
   }
 
-  const typePlanete = planet.modelePlanete?.typePlanete ?? null;
+  const typePlanete = planet.modelePlanete?.typePlanete ?? planet.typePlanete ?? null;
+  const biome = planet.modelePlanete?.biome ?? planet.biome ?? null;
 
   return {
     identifiant: planet.identifiant ?? planet.id ?? null,
@@ -255,9 +290,9 @@ function normalizePlanet(planet) {
     mineraiDisponible: Number(planet.mineraiDisponible ?? 0),
     pointDeVie: Number(planet.pointDeVie ?? 0),
     slotsConstruction: Number(planet.slotsConstruction ?? 0),
-    biome: planet.modelePlanete?.biome ?? null,
+    biome,
     typePlanete,
-    estVide: typePlanete === "VIDE",
+    estVide: String(typePlanete).toUpperCase() === "VIDE",
     modules: Array.isArray(planet.modules) ? planet.modules : []
   };
 }
@@ -1327,12 +1362,18 @@ app.get("/api/map", ensureConfig, async (req, res, next) => {
   try {
     const xRange = parseRange(req.query.x_range, DEFAULT_RANGE.x);
     const yRange = parseRange(req.query.y_range, DEFAULT_RANGE.y);
-    const payload = await apiGet(
-      `/monde/map?x_range=${xRange.join(",")}&y_range=${yRange.join(",")}`
-    );
-    const cells = extractArray(payload)
-      .map(normalizeCell)
-      .filter(Boolean);
+
+    let cells = [];
+    const isLargeRequest = (xRange[1] - xRange[0] > 20) || (yRange[1] - yRange[0] > 20);
+    
+    if (isLargeRequest && cachedFullMap.length > 0) {
+      cells = cachedFullMap;
+    } else {
+      const payload = await apiGet(
+        `/monde/map?x_range=${xRange.join(",")}&y_range=${yRange.join(",")}`
+      );
+      cells = extractArray(payload).map(normalizeCell).filter(Boolean);
+    }
 
     res.json({
       range: { x: xRange, y: yRange },
