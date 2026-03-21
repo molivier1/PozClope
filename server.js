@@ -710,6 +710,7 @@ async function fetchLeaderboard() {
       .filter(entry => entry.idEquipe)
       .map(entry => ({
         nom: entry.nom,
+        type: entry.type,
         score: getScore(entry)
       }))
       .sort((a, b) => b.score - a.score)

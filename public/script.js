@@ -197,7 +197,7 @@ function renderLeaderboard(entries, message) {
       return `
         <li class="${itemClass}">
           <span class="leaderboard-rank">${entry.rang}</span>
-          <span class="leaderboard-name">${entry.nom}</span>
+          <span class="leaderboard-name">[${entry.type}] ${entry.nom}</span>
           <span class="leaderboard-score">${entry.score}</span>
         </li>
       `;
