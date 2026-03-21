@@ -1,8 +1,8 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import './App.css';
 
-const FULL_MAP = 58; 
-const BASE_CELL_SIZE = 50; 
+const FULL_MAP = 58;
+const BASE_CELL_SIZE = 50;
 
 const ShipImage = ({ ship }) => {
   const [errorLevel, setErrorLevel] = useState(0);
@@ -35,8 +35,8 @@ const ShipImage = ({ ship }) => {
 
   if (errorLevel >= sources.length) {
     return (
-      <div 
-        style={{ width: '20px', height: '20px', backgroundColor: 'var(--accent)', borderRadius: '50%', boxShadow: '0 0 10px var(--accent)', position: 'absolute', zIndex: 20 }} 
+      <div
+        style={{ width: '20px', height: '20px', backgroundColor: 'var(--accent)', borderRadius: '50%', boxShadow: '0 0 10px var(--accent)', position: 'absolute', zIndex: 20 }}
         title={ship.id}
       />
     );
@@ -109,7 +109,7 @@ function App() {
         fetch('/api/state'),
         fetch('/api/leaderboard').catch(() => null) // Fail silently if leaderboard is unavailable
       ]);
-      
+
       if (!stateRes.ok) throw new Error(`API error: ${stateRes.status}`);
       const stateData = await stateRes.json();
 
@@ -117,30 +117,62 @@ function App() {
       if (stateData.ships) {
         setShips(stateData.ships.map(s => ({
           id: s.nom,
-          x: s.coord_x,
-          y: s.coord_y,
+          x: Number(s.coord_x ?? s.x ?? s.positionX),
+          y: Number(s.coord_y ?? s.y ?? s.positionY),
           hp: s.pointDeVie,
           asset: s.type ? String(s.type).toLowerCase() : 'explorateur',
           cargo: s.mineraiTransporte
         })));
       }
 
-      // 2. Correct Planet Mapping (matches getMap.js JSON)
-      if (stateData.cells) {
-        setPlanets(stateData.cells
-          .filter(cell => cell.planete && !cell.planete.estVide)
-          .map(cell => ({
-            x: cell.coord_x,
-            y: cell.coord_y,
-            name: cell.planete.nom,
-            category: (cell.planete.typePlanete || cell.planete.modelePlanete?.typePlanete) === 'GAZEUSE' ? 'gazeuse' : 'tellurique',
-            biome: (cell.planete.biome || cell.planete.modelePlanete?.biome || 'terre').toLowerCase(),
-            hp: cell.planete.pointDeVie,
-            minerals: cell.planete.mineraiDisponible,
-            owner: cell.proprietaire ? cell.proprietaire.nom : 'UNCLAIMED',
-            slots: cell.planete.slotsConstruction
-          })));
+      // 2. Robust Planet Mapping (Team Owned + Visible Cells)
+      const allPlanetsMap = new Map();
+
+      // A. Charger mes planètes (via l'objet Team, garanti d'être là)
+      if (stateData.team && stateData.team.planetes) {
+        stateData.team.planetes.forEach(p => {
+          const x = Number(p.coord_x);
+          const y = Number(p.coord_y);
+          if (!Number.isNaN(x) && !Number.isNaN(y)) {
+            allPlanetsMap.set(`${x},${y}`, {
+              x, y,
+              name: p.nom || "Ma Planète",
+              category: (p.typePlanete === 'GAZEUSE') ? 'gazeuse' : 'tellurique',
+              biome: (p.biome || 'terre').toLowerCase(),
+              hp: Number(p.pointDeVie || 0),
+              minerals: Number(p.mineraiDisponible || 0),
+              owner: stateData.team.nom || "ME",
+              slots: Number(p.slotsConstruction || 0)
+            });
+          }
+        });
       }
+
+      // B. Charger les planètes visibles sur la carte (complète la vue)
+      if (stateData.cells) {
+        stateData.cells.forEach(cell => {
+          if (cell.planete && !cell.planete.estVide) {
+            const x = Number(cell.coord_x ?? cell.x);
+            const y = Number(cell.coord_y ?? cell.y);
+            if (!Number.isNaN(x) && !Number.isNaN(y)) {
+              allPlanetsMap.set(`${x},${y}`, {
+                x, y,
+                name: cell.planete.nom || "Inconnue",
+                category: (cell.planete.typePlanete || cell.planete.modelePlanete?.typePlanete) === 'GAZEUSE' ? 'gazeuse' : 'tellurique',
+                biome: (cell.planete.biome || cell.planete.modelePlanete?.biome || 'terre').toLowerCase(),
+                hp: Number(cell.planete.pointDeVie ?? 0),
+                minerals: Number(cell.planete.mineraiDisponible ?? 0),
+                owner: cell.proprietaire ? cell.proprietaire.nom : 'UNCLAIMED',
+                slots: Number(cell.planete.slotsConstruction ?? 0)
+              });
+            }
+          }
+        });
+      }
+
+      const parsedPlanets = Array.from(allPlanetsMap.values());
+      console.log(`Planètes chargées : ${parsedPlanets.length}`, parsedPlanets[0]);
+      setPlanets(parsedPlanets);
 
       // 3. Leaderboard Mapping
       if (leaderRes && leaderRes.ok) {
@@ -159,23 +191,29 @@ function App() {
 
   useEffect(() => {
     fetchData();
-    const interval = setInterval(fetchData, 4000); 
+    const interval = setInterval(fetchData, 4000);
     return () => clearInterval(interval);
   }, []);
 
-  // Center viewport on the first ship
+  // Center viewport on the first ship OR first planet
   useEffect(() => {
+    let target = null;
     if (ships.length > 0) {
-      const activeShip = ships[0];
-      const fleetX = (activeShip.x * BASE_CELL_SIZE) + (BASE_CELL_SIZE / 2);
-      const fleetY = (activeShip.y * BASE_CELL_SIZE) + (BASE_CELL_SIZE / 2);
-      
-      setViewport({ 
-        x: (window.innerWidth / 2) - (fleetX * zoom), 
-        y: (window.innerHeight / 2) - (fleetY * zoom) 
+      target = ships[0];
+    } else if (planets.length > 0) {
+      target = planets[0];
+    }
+
+    if (target) {
+      const targetX = (target.x * BASE_CELL_SIZE) + (BASE_CELL_SIZE / 2);
+      const targetY = (target.y * BASE_CELL_SIZE) + (BASE_CELL_SIZE / 2);
+
+      setViewport({
+        x: (window.innerWidth / 2) - (targetX * zoom),
+        y: (window.innerHeight / 2) - (targetY * zoom)
       });
     }
-  }, [ships[0]?.x, ships[0]?.y, zoom]); // Reacts when the active ship moves
+  }, [ships[0]?.x, ships[0]?.y, planets[0]?.x, planets[0]?.y, zoom, ships.length, planets.length]);
 
   // Keep selected item updated when data changes (e.g., ship moves, takes damage)
   useEffect(() => {
@@ -198,9 +236,9 @@ function App() {
 
   return (
     <div className="game-container">
-      <div 
-        className="map-canvas" 
-        style={{ 
+      <div
+        className="map-canvas"
+        style={{
           transform: `translate(${viewport.x}px, ${viewport.y}px) scale(${zoom})`,
           '--hole-x': `${holeX}px`,
           '--hole-y': `${holeY}px`
@@ -276,9 +314,9 @@ function App() {
       {selected && (
         <>
           <svg className="connector-svg">
-            <path 
-              d={`M ${(viewport.x + (selected.x * BASE_CELL_SIZE + (BASE_CELL_SIZE / 2)) * zoom)},${(viewport.y + (selected.y * BASE_CELL_SIZE + (BASE_CELL_SIZE / 2)) * zoom)} L ${window.innerWidth - 580},170`} 
-              className="tech-line" 
+            <path
+              d={`M ${(viewport.x + (selected.x * BASE_CELL_SIZE + (BASE_CELL_SIZE / 2)) * zoom)},${(viewport.y + (selected.y * BASE_CELL_SIZE + (BASE_CELL_SIZE / 2)) * zoom)} L ${window.innerWidth - 580},170`}
+              className="tech-line"
             />
           </svg>
 
@@ -287,13 +325,13 @@ function App() {
             <h3 className="value-neon" style={{ margin: '5px 0', textTransform: 'uppercase' }}>
               {selected.id || selected.name}
             </h3>
-            
+
             <div className="flex-col">
               <div className="mini-row">
                 <span>TYPE</span>
                 <span style={{ color: '#fff', textTransform: 'uppercase' }}>{selected.asset || selected.biome || 'UNKNOWN'}</span>
               </div>
-              
+
               <div className="mini-progress"><div className="fill" style={{ width: '100%' }}></div></div>
 
               <div className="mini-row" style={{ marginTop: '8px' }}>
