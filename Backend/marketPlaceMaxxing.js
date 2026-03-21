@@ -12,6 +12,7 @@ export async function exportVaisseauxCSV() {
     return {
       prix: offre.prix || 0,
       statut: offre.statut || '',
+      idVendeur: offre.idVendeur || '',
       nom: vaisseau.nom || '',
       attaque: vaisseau.attaque || 0,
       pointsDeVie: vaisseau.pointDeVie || 0,
@@ -20,6 +21,11 @@ export async function exportVaisseauxCSV() {
       coutDeConstruction: vaisseau.coutConstruction || 0,
     };
   });
+
+  if (csvData.length === 0) {
+    console.log('⚠️ Aucune offre trouvée.');
+    return;
+  }
 
   // Convertir en CSV
   const headers = Object.keys(csvData[0]).join(';');
