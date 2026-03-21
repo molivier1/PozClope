@@ -218,7 +218,43 @@ function parseJson(value) {
 }
 
 function extractArray(payload) {
-  return Array.isArray(payload) ? payload : [];
+  if (Array.isArray(payload)) {
+    return payload;
+  }
+
+  if (Array.isArray(payload?.teams)) {
+    return payload.teams;
+  }
+
+  if (Array.isArray(payload?.equipes)) {
+    return payload.equipes;
+  }
+
+  if (Array.isArray(payload?.leaderboard)) {
+    return payload.leaderboard;
+  }
+
+  if (Array.isArray(payload?.classement)) {
+    return payload.classement;
+  }
+
+  if (Array.isArray(payload?.content)) {
+    return payload.content;
+  }
+
+  if (Array.isArray(payload?.data)) {
+    return payload.data;
+  }
+
+  if (Array.isArray(payload?.items)) {
+    return payload.items;
+  }
+
+  if (Array.isArray(payload?.result)) {
+    return payload.result;
+  }
+
+  return [];
 }
 
 function pickCoord(payload, axis) {
@@ -355,6 +391,20 @@ async function getShips() {
 
 async function getTeam() {
   return apiGet(`/equipes/${TEAM_ID}`);
+}
+
+async function getTeamById(teamId) {
+  return normalizeTeam(await apiGet(`/equipes/${teamId}`));
+}
+
+async function getTeams() {
+  return extractArray(await apiGet("/equipes")).map(normalizeTeam);
+}
+
+async function getTeamsDetailed() {
+  const teams = await getTeams();
+  const teamIds = teams.map((team) => team.identifiant).filter(Boolean);
+  return Promise.all(teamIds.map((teamId) => getTeamById(teamId)));
 }
 
 async function getPlans() {
@@ -609,6 +659,8 @@ function printUsage() {
   console.log("Usage:");
   console.log("npm.cmd run game -- ships");
   console.log("npm.cmd run game -- team");
+  console.log("npm.cmd run game -- credits");
+  console.log("npm.cmd run game -- planet-counts");
   console.log("npm.cmd run game -- cell 5 40");
   console.log("npm.cmd run game -- build-options");
   console.log('npm.cmd run game -- buy-offer "uuid-offre"');
@@ -691,6 +743,78 @@ function printBuildOptions(team) {
     console.log(
       `- ${type.classeVaisseau} | planete ${type.planeteNom} | typeId ${type.identifiant}`
     );
+  }
+}
+
+function getResourceQuantity(team, resourceName) {
+  const normalizedName = String(resourceName).toUpperCase();
+
+  const resource = (team.ressources || []).find((entry) => {
+    const resourceType = String(entry.type ?? "").toUpperCase();
+    const resourceLabel = String(entry.nom ?? "").toUpperCase();
+    return resourceType === normalizedName || resourceLabel === normalizedName;
+  });
+
+  return Number(resource?.quantite ?? 0);
+}
+
+function printTeamCredits(teams) {
+  const rows = teams
+    .filter((team) => team.identifiant && team.identifiant !== TEAM_ID)
+    .map((team) => ({
+      nom: team.nom,
+      credits: getResourceQuantity(team, "CREDIT"),
+      points: getResourceQuantity(team, "POINT")
+    }))
+    .sort((left, right) => {
+      if (right.credits !== left.credits) {
+        return right.credits - left.credits;
+      }
+
+      if (right.points !== left.points) {
+        return right.points - left.points;
+      }
+
+      return left.nom.localeCompare(right.nom, "fr");
+    });
+
+  if (rows.length === 0) {
+    console.log("Aucune autre equipe trouvee.");
+    return;
+  }
+
+  for (const row of rows) {
+    console.log(`- ${row.nom} | CREDIT ${row.credits} | POINT ${row.points}`);
+  }
+}
+
+function printTeamPlanetCounts(teams) {
+  const rows = teams
+    .filter((team) => team.identifiant && team.identifiant !== TEAM_ID)
+    .map((team) => ({
+      nom: team.nom,
+      planetes: Array.isArray(team.planetes) ? team.planetes.length : 0,
+      points: getResourceQuantity(team, "POINT")
+    }))
+    .sort((left, right) => {
+      if (right.planetes !== left.planetes) {
+        return right.planetes - left.planetes;
+      }
+
+      if (right.points !== left.points) {
+        return right.points - left.points;
+      }
+
+      return left.nom.localeCompare(right.nom, "fr");
+    });
+
+  if (rows.length === 0) {
+    console.log("Aucune autre equipe trouvee.");
+    return;
+  }
+
+  for (const row of rows) {
+    console.log(`- ${row.nom} | PLANETES ${row.planetes} | POINT ${row.points}`);
   }
 }
 
@@ -777,6 +901,26 @@ async function run() {
 
   if (command === "team") {
     printTeam(await getTeam());
+    return;
+  }
+
+  if (command === "credits") {
+    printTeamCredits(await getTeams());
+    return;
+  }
+
+  if (command === "planet-counts") {
+    try {
+      printTeamPlanetCounts(await getTeamsDetailed());
+    } catch (error) {
+      if (error?.status === 403) {
+        fail(
+          "Impossible de compter les planetes des autres equipes: le detail /equipes/{id} est refuse (403) avec vos droits actuels."
+        );
+      }
+
+      throw error;
+    }
     return;
   }
 
@@ -1095,7 +1239,10 @@ module.exports = {
   getModules,
   getPlans,
   getShips,
+  getTeams,
+  getTeamsDetailed,
   getTeam,
+  getTeamById,
   getTeamState,
   normalizeText,
   placeModule,
