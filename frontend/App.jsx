@@ -1,76 +1,158 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import './App.css';
 
-const GRID_SIZE = 58;
+const FULL_MAP = 58; 
+const BASE_CELL_SIZE = 50; 
+
+const ShipImage = ({ ship }) => {
+  const [errorLevel, setErrorLevel] = useState(0);
+
+  useEffect(() => {
+    setErrorLevel(0);
+  }, [ship.asset]);
+
+  const capitalAsset = ship.asset.charAt(0).toUpperCase() + ship.asset.slice(1);
+
+  // Super Fallback: Hunts down the most common spelling and capitalization variations
+  const sources = [
+    `/assets/assets 2d/vaisseaux_2D/${ship.asset}.png`,
+    `/assets/assets 2d/vaisseaux_2D/${ship.asset}.svg`,
+    `/assets/assets 2d/vaisseaux_2D/${capitalAsset}.png`,
+    `/assets/assets 2d/vaisseaux_2D/${capitalAsset}.svg`,
+    `/assets/assets 2d/Vaisseaux_2D/${ship.asset}.png`,
+    `/assets/assets 2d/Vaisseaux_2D/${capitalAsset}.png`,
+    `/assets/assets 2d/vaisseaux/${ship.asset}.png`,
+    `/assets/assets 2d/vaisseaux/${capitalAsset}.png`,
+    `/assets/assets 2d/vaisseaux_2D/explorateur.png`,
+    `/assets/assets 2d/vaisseaux_2D/Explorateur.png`
+  ];
+
+  if (errorLevel >= sources.length) {
+    return (
+      <div 
+        style={{ width: '20px', height: '20px', backgroundColor: 'var(--accent)', borderRadius: '50%', boxShadow: '0 0 10px var(--accent)', position: 'absolute', zIndex: 20 }} 
+        title={ship.id}
+      />
+    );
+  }
+
+  return (
+    <img
+      src={sources[errorLevel]}
+      className="asset-img"
+      style={{ width: '60%', position: 'absolute', zIndex: 20 }}
+      alt={ship.id}
+      onError={() => setErrorLevel(prev => prev + 1)}
+    />
+  );
+};
 
 function App() {
-  // MOCK DATA: Replace these with API calls later
-  const [credits] = useState(1500);
-  const [teamScore] = useState(500);
-  const [selectedEntity, setSelectedEntity] = useState(null);
+  const [ships, setShips] = useState([]);
+  const [planets, setPlanets] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [zoom, setZoom] = useState(1);
+  const [viewport, setViewport] = useState({ x: 0, y: 0 });
+  const [selected, setSelected] = useState(null);
 
-  // Mock positions for your initial 2 ships and base planet [cite: 59]
-  const [ships] = useState([
-    { id: 's1', x: 10, y: 10, type: 'scout', hp: 100 },
-    { id: 's2', x: 11, y: 10, type: 'miner', hp: 100 }
-  ]);
+  const fetchData = async () => {
+    try {
+      const res = await fetch('/api/state');
+      if (!res.ok) throw new Error(`API error: ${res.status}`);
+      const stateData = await res.json();
 
-  const [planets] = useState([
-    { x: 10, y: 11, name: "Home Planet", type: "base", owner: "me" }
-  ]);
-
-  const handleCellClick = (x, y) => {
-    const ship = ships.find(s => s.x === x && s.y === y);
-    const planet = planets.find(p => p.x === x && p.y === y);
-    setSelectedEntity(ship || planet || { type: 'empty', x, y });
-  };
-
-  const renderGrid = () => {
-    let cells = [];
-    for (let y = 0; y < GRID_SIZE; y++) {
-      for (let x = 0; x < GRID_SIZE; x++) {
-        const ship = ships.find(s => s.x === x && s.y === y);
-        const planet = planets.find(p => p.x === x && p.y === y);
-
-        cells.push(
-          <div key={`${x}-${y}`} className="cell" onClick={() => handleCellClick(x, y)}>
-            {planet && <img src={`/assets/planet_${planet.type}.png`} className="asset-img" />}
-            {ship && <img src={`/assets/ship_${ship.type}.png`} className="asset-img" />}
-          </div>
-        );
+      // 1. Correct Ship Mapping (matches your console output)
+      if (stateData.ships) {
+        setShips(stateData.ships.map(s => ({
+          id: s.nom,
+          x: s.coord_x,
+          y: s.coord_y,
+          hp: s.pointDeVie,
+          asset: s.type ? String(s.type).toLowerCase() : 'explorateur',
+          cargo: s.mineraiTransporte
+        })));
       }
+
+      // 2. Correct Planet Mapping (matches getMap.js JSON)
+      if (stateData.cells) {
+        setPlanets(stateData.cells
+          .filter(cell => cell.planete && !cell.planete.estVide)
+          .map(cell => ({
+            x: cell.coord_x,
+            y: cell.coord_y,
+            name: cell.planete.nom,
+            category: cell.planete.typePlanete === 'GAZEUSE' ? 'gazeuse' : 'tellurique',
+            biome: cell.planete.biome ? cell.planete.biome.toLowerCase() : 'terre'
+          })));
+      }
+      setLoading(false);
+    } catch (err) {
+      console.error("Fetch failed:", err);
+      setLoading(false);
     }
-    return cells;
   };
+
+  useEffect(() => {
+    fetchData();
+    const interval = setInterval(fetchData, 4000); 
+    return () => clearInterval(interval);
+  }, []);
+
+  // Center viewport on the first ship
+  useEffect(() => {
+    if (ships.length > 0) {
+      const activeShip = ships[0];
+      const fleetX = (activeShip.x * BASE_CELL_SIZE) + (BASE_CELL_SIZE / 2);
+      const fleetY = (activeShip.y * BASE_CELL_SIZE) + (BASE_CELL_SIZE / 2);
+      
+      setViewport({ 
+        x: (window.innerWidth / 2) - (fleetX * zoom), 
+        y: (window.innerHeight / 2) - (fleetY * zoom) 
+      });
+    }
+  }, [ships[0]?.x, ships[0]?.y, zoom]); // Reacts when the active ship moves
+
+  // Pixel coordinates for the Fog of War hole
+  const holeX = ships[0] ? (ships[0].x * BASE_CELL_SIZE + 25) : 0;
+  const holeY = ships[0] ? (ships[0].y * BASE_CELL_SIZE + 25) : 0;
+
+  if (loading) return <div className="loading">CONNECTING...</div>;
 
   return (
     <div className="game-container">
-      {/* SIDEBAR: Ranking and Stats  */}
-      <div className="sidebar" style={{ width: '300px', padding: '20px', borderRight: '1px solid #333' }}>
-        <h2>Space Conquerors</h2>
-        <div className="stats-card">
-          <p>Credits: 🪙 {credits}</p>
-          <p>Score: ⭐ {teamScore}</p>
-        </div>
-        <hr />
-        {selectedEntity ? (
-          <div className="inspector">
-            <h3>Inspector</h3>
-            <p>Type: {selectedEntity.type}</p>
-            <p>Coords: {selectedEntity.x}, {selectedEntity.y}</p>
-            {selectedEntity.hp && <p>HP: {selectedEntity.hp}%</p>}
-            {/* Action buttons appear here [cite: 88] */}
-            <button className="action-btn">MOVE</button>
-            <button className="action-btn">RECOLTER</button>
-          </div>
-        ) : <p>Select a ship or planet</p>}
+      <div 
+        className="map-canvas" 
+        style={{ 
+          transform: `translate(${viewport.x}px, ${viewport.y}px) scale(${zoom})`,
+          '--hole-x': `${holeX}px`,
+          '--hole-y': `${holeY}px`
+        }}
+      >
+        {[...Array(FULL_MAP * FULL_MAP)].map((_, i) => {
+          const x = i % FULL_MAP;
+          const y = Math.floor(i / FULL_MAP);
+          const ship = ships.find(s => s.x === x && s.y === y);
+          const planet = planets.find(p => p.x === x && p.y === y);
+
+          return (
+            <div key={i} className="cell" onClick={() => setSelected(ship || planet)}>
+              {planet && (
+                <img 
+                  src={`/assets/assets 2d/planets/${planet.category}/${planet.biome}.svg`} 
+                  className="asset-img planet-glow" 
+                />
+              )}
+              {ship && <ShipImage ship={ship} />}
+            </div>
+          );
+        })}
+        {/* Fog layer is inside the canvas so it scales with everything */}
+        <div className="fow-overlay" />
       </div>
 
-      {/* MAP VIEWPORT  */}
-      <div className="map-viewport">
-        <div className="grid-layer">
-          {renderGrid()}
-        </div>
+      <div className="hud-panel glass-tech hud-top-left">
+        <div className="glitch-text label-tiny">// LIVE_DATA_LINK</div>
+        <div className="flex-between"><span>SHIPS ACTIVE</span><span className="value-neon">{ships.length}</span></div>
       </div>
     </div>
   );

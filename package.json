@@ -3,13 +3,23 @@
   "private": true,
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js",
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "server": "node server.js",
+    "server:dev": "node --watch server.js",
     "test:harvest-loop": "node scripts/test-harvest-loop.js",
     "game": "node scripts/game.js",
     "farm": "node scripts/farm.js"
   },
   "dependencies": {
     "dotenv": "^17.3.1",
-    "express": "^5.2.1"
+    "express": "^5.2.1",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.0.0",
+    "vite": "^5.0.0"
   }
 }
