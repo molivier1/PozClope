@@ -105,8 +105,10 @@ function App() {
 
   const fetchData = async () => {
     try {
-      const [stateRes, leaderRes] = await Promise.all([
-        fetch('/api/state'),
+      const [stateRes, mapRes, leaderRes] = await Promise.all([
+        // On demande TOUTE la carte directement sur /api/state car c'est la seule route garantie d'exister
+        fetch(`/api/state?x_range=0,${FULL_MAP - 1}&y_range=0,${FULL_MAP - 1}`),
+        fetch(`/api/map?x_range=0,${FULL_MAP - 1}&y_range=0,${FULL_MAP - 1}`).catch(() => null), // Tentative bonus
         fetch('/api/leaderboard').catch(() => null) // Fail silently if leaderboard is unavailable
       ]);
 
@@ -123,6 +125,13 @@ function App() {
           asset: s.type ? String(s.type).toLowerCase() : 'explorateur',
           cargo: s.mineraiTransporte
         })));
+      }
+
+      // On utilise les cellules de /api/map si dispo, sinon on garde celles de state
+      let mapCells = stateData.cells || [];
+      if (mapRes && mapRes.ok) {
+        const mapData = await mapRes.json();
+        if (mapData.cells) mapCells = mapData.cells;
       }
 
       // 2. Robust Planet Mapping (Team Owned + Visible Cells)
@@ -149,8 +158,8 @@ function App() {
       }
 
       // B. Charger les planètes visibles sur la carte (complète la vue)
-      if (stateData.cells) {
-        stateData.cells.forEach(cell => {
+      if (mapCells) {
+        mapCells.forEach(cell => {
           if (cell.planete && !cell.planete.estVide) {
             const x = Number(cell.coord_x ?? cell.x);
             const y = Number(cell.coord_y ?? cell.y);
@@ -231,15 +240,31 @@ function App() {
   // Pixel coordinates for the Fog of War hole
   const holeX = ships[0] ? (ships[0].x * BASE_CELL_SIZE + 25) : (FULL_MAP * BASE_CELL_SIZE / 2);
   const holeY = ships[0] ? (ships[0].y * BASE_CELL_SIZE + 25) : (FULL_MAP * BASE_CELL_SIZE / 2);
+  
+  // Gestion du Drag & Drop de la carte
+  const [isDragging, setIsDragging] = useState(false);
+  const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
+
+  const handleMouseDown = (e) => {
+    setIsDragging(true);
+    setDragStart({ x: e.clientX - viewport.x, y: e.clientY - viewport.y });
+  };
+
+  const handleMouseMove = (e) => {
+    if (isDragging) {
+      setViewport({ x: e.clientX - dragStart.x, y: e.clientY - dragStart.y });
+    }
+  };
 
   if (loading) return <div className="loading">CONNECTING...</div>;
 
   return (
-    <div className="game-container">
+    <div className="game-container" onMouseDown={handleMouseDown} onMouseMove={handleMouseMove} onMouseUp={() => setIsDragging(false)} onMouseLeave={() => setIsDragging(false)}>
       <div
         className="map-canvas"
         style={{
           transform: `translate(${viewport.x}px, ${viewport.y}px) scale(${zoom})`,
+          cursor: isDragging ? 'grabbing' : 'grab',
           '--hole-x': `${holeX}px`,
           '--hole-y': `${holeY}px`
         }}
