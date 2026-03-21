@@ -4,14 +4,14 @@ import { getAllVaisseaux } from './getAllVaisseaux.js';
 
 async function main() {
   /*
-  getMap
+  getMap*/
   try {
     const map = await getFullMap(58, 18);
     console.log("Map complète :", JSON.stringify(map, null, 2));
   } catch (err) {
     console.error("Erreur :", err.message);
   }
-    */
+    /**/
    /* 
    getEquipes
    try {
@@ -21,12 +21,13 @@ async function main() {
     console.error("Erreur :", err.message);
   }
     */
+   /*
    try {
     const vaisseaux = await getAllVaisseaux();
     console.log(JSON.stringify(vaisseaux, null, 2));
   } catch (err) {
     console.error("Erreur :", err.message);
-  }
+  }*/
 }
 
 main();

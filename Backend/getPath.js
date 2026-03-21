@@ -2,7 +2,7 @@ const API_URL = process.env.API_URL;
 const TOKEN = process.env.TOKEN?.trim();
 const TEAM_ID = process.env.TEAM_ID;
 
-async function get(path) {
+export async function get(path) {
   const res = await fetch(`${API_URL}${path}`, {
     headers: {
       Authorization: `Bearer ${TOKEN}`,
@@ -17,5 +17,3 @@ async function get(path) {
 
   return res.json();
 }
-
-module.exports = { get };
