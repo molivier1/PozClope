@@ -19,7 +19,8 @@ export async function getAllVaisseaux() {
       coord_x: c.coord_x,
       coord_y: c.coord_y,
       pointDeVie: c.vaisseau.pointDeVie,
-      type: c.vaisseau.type.nom
+      type: c.vaisseau.type.nom,
+      classe: c.vaisseau.type.classeVaisseau
     }));
 
   return vaisseaux;

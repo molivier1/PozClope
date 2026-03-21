@@ -1,6 +1,7 @@
 import { getFullMap } from './getFullMap.js';
 import { getEquipes } from './getEquipes.js';
 import { getAllVaisseaux, getVaisseauxEquipe } from './getAllVaisseaux.js';
+import { getAllPlanetes } from './getAllPlanetes.js';
 import fs from 'fs'
 
 async function main() {
@@ -26,19 +27,20 @@ async function main() {
     console.error("Erreur :", err.message);
   }
     */
-   /*
+   
    try {
-    const vaisseaux = await getAllVaisseaux();
-    console.log(JSON.stringify(vaisseaux, null, 2));
+    const planetes = await getAllPlanetes();
+    console.log(JSON.stringify(planetes, null, 2));
   } catch (err) {
     console.error("Erreur :", err.message);
-  }*/
+  }
+ /*
  try {
     const vaisseaux = await getVaisseauxEquipe("PozClope");
     console.log(JSON.stringify(vaisseaux, null, 2));
   } catch (err) {
     console.error("Erreur :", err.message);
-  }
+  }*/
 }
 
 main();
