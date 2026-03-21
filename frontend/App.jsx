@@ -211,23 +211,26 @@ function App() {
     return () => clearInterval(interval);
   }, []);
 
+  const [hasCentered, setHasCentered] = useState(false);
+
   useEffect(() => {
-    let target = null;
+    if (hasCentered) return;
+
     const myShips = ships.filter((s) => !s.isEnemy);
-    if (myShips.length > 0) {
-      target = myShips[0];
-    }
+    if (myShips.length === 0) return;
 
-    if (target) {
-      const targetX = (target.x * BASE_CELL_SIZE) + (BASE_CELL_SIZE / 2);
-      const targetY = (target.y * BASE_CELL_SIZE) + (BASE_CELL_SIZE / 2);
+    const target = myShips[0];
 
-      setViewport({
-        x: (window.innerWidth / 2) - (targetX * zoom),
-        y: (window.innerHeight / 2) - (targetY * zoom)
-      });
-    }
-  }, [ships[0]?.x, ships[0]?.y, zoom, ships.length]);
+    const targetX = (target.x * BASE_CELL_SIZE) + (BASE_CELL_SIZE / 2);
+    const targetY = (target.y * BASE_CELL_SIZE) + (BASE_CELL_SIZE / 2);
+
+    setViewport({
+      x: (window.innerWidth / 2) - (targetX * zoom),
+      y: (window.innerHeight / 2) - (targetY * zoom)
+    });
+
+    setHasCentered(true);
+  }, [ships]);
 
   useEffect(() => {
     if (!selected) {
