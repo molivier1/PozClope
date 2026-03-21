@@ -1,311 +1,749 @@
-import 'dotenv/config';
-import { getFullMap } from './getFullMap.js';
-import { getAllVaisseaux } from './getAllVaisseaux.js';
-import { createRequire } from 'module';
+import dotenv from "dotenv";
+import path from "path";
+import { fileURLToPath } from "url";
+import { getEquipes } from "./getEquipes.js";
+import { getFullMap } from "./getFullMap.js";
 
-const require = createRequire(import.meta.url);
-const { attaquer } = require('./attaquer.js');
-const { deplacer } = require('./deplacer.js');
-const { conquerir } = require('./conquerir.js');
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
-// --- CONFIGURATION ---
-const DELAY_MS = 1000; // Temps entre chaque tour de boucle
+dotenv.config({ path: path.join(__dirname, ".env") });
+dotenv.config({ path: path.join(__dirname, "..", ".env"), override: false });
 
-const MES_VAISSEAUX_IDS = [
-  '54053e0c-14ea-4946-89d5-d640e4e9e2a2'
-];
+const API_URL = process.env.API_URL;
+const TOKEN = process.env.TOKEN?.trim();
+const TEAM_ID = process.env.TEAM_ID;
 
-// --- ETAT GLOBAL ---
-const cooldowns = {}; // Stocke les temps d'attente : { idVaisseau: timestampFin }
-const failedMoves = new Set(); // Stocke les mouvements échoués : "idVaisseau,x,y"
+const LOOP_DELAY_MS = parseNumber(process.env.ATTACK_LOOP_MS, 2000);
+const FOCUS_RADIUS = parseNumber(process.env.ATTACK_FOCUS_RADIUS, 8);
+const ATTACK_RANGE = parseNumber(process.env.ATTACK_RANGE, 1);
+const CONQUER_PLANETS = process.env.ATTACK_CONQUER_PLANETS === "1";
 
-function updateCooldown(idVaisseau, errorMsg) {
-  // Analyse du message : "Vaisseau indisponible, prochaine disponibilité : 21:48:13"
-  const match = errorMsg.match(/prochaine disponibilité\s*:\s*(\d{2}):(\d{2}):(\d{2})/);
-  if (match) {
-    const [_, h, m, s] = match;
-    const now = new Date();
-    const nextAction = new Date();
-    nextAction.setHours(parseInt(h, 10), parseInt(m, 10), parseInt(s, 10), 0);
+const MY_TEAM_NAME = process.env.MY_TEAM_NAME || "PozClope";
+const ALLIED_TEAMS = new Set(
+  (process.env.ALLIED_TEAMS || `${MY_TEAM_NAME},Sudo Win`)
+    .split(",")
+    .map((name) => name.trim())
+    .filter(Boolean)
+);
 
-    // On ajoute 1 seconde de sécurité pour être sûr que le serveur valide l'action suivante
-    const releaseTime = nextAction.getTime() + 1000; 
+const ATTACK_SHIP_IDS = new Set(
+  (process.env.ATTACK_SHIP_IDS || "")
+    .split(",")
+    .map((id) => id.trim())
+    .filter(Boolean)
+);
 
-    cooldowns[idVaisseau] = releaseTime;
-    console.log(`⏳ Cooldown détecté pour ${idVaisseau.slice(0, 5)} -> Reprise à ${h}:${m}:${s}`);
-  }
+const ATTACK_SHIP_NAMES = new Set(
+  (process.env.ATTACK_SHIP_NAMES || "")
+    .split(",")
+    .map((name) => normalizeText(name))
+    .filter(Boolean)
+);
+
+const FOCUS_POINTS = parseFocusPoints(process.env.ATTACK_FOCUS_POINTS || "");
+
+const cooldownOverrides = new Map();
+const failedMoves = new Map();
+let stickyTargetKey = null;
+
+function parseNumber(value, fallback) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
 }
 
-// --- FONCTIONS API ---
-
-async function actionDeplacer(idVaisseau, x, y) {
-  try {
-    const res = await deplacer(idVaisseau, x, y);
-    return res;
-  } catch (e) {
-    console.error(`Erreur déplacement ${idVaisseau}:`, e.message);
-    updateCooldown(idVaisseau, e.message);
-
-    // Si le mouvement est bloqué (obstacle ou vide), on l'ajoute à la liste noire temporaire
-    if (e.message.includes("inaccessible") || e.message.includes("obstacle") || e.message.includes("403") || e.message.includes("400")) {
-      const key = `${idVaisseau},${x},${y}`;
-      failedMoves.add(key);
-      setTimeout(() => failedMoves.delete(key), 10000); // On oublie cet obstacle après 10 secondes
-    }
-  }
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function actionAttaquer(idAttaquant, x, y) {
-  try {
-    const res = await attaquer(idAttaquant, x, y);
-    console.log(`⚔️  ${idAttaquant.slice(0, 5)} attaque (${x}, ${y}):`, res.message || res);
-    return res;
-  } catch (e) {
-    console.error(`Erreur attaque ${idAttaquant}:`, e.message);
-    updateCooldown(idAttaquant, e.message);
-  }
+function log(message) {
+  console.log(`[${new Date().toLocaleTimeString("fr-FR")}] ${message}`);
 }
 
-async function actionConquerir(idVaisseau, x, y) {
-  try {
-    const res = await conquerir(idVaisseau, x, y);
-    console.log(`🚩 ${idVaisseau.slice(0, 5)} conquiert la planète (${x}, ${y}):`, res.message || res);
-    return res;
-  } catch (e) {
-    console.error(`Erreur conquête ${idVaisseau}:`, e.message);
-    updateCooldown(idVaisseau, e.message);
-  }
+function normalizeText(value) {
+  return String(value)
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
 }
 
-// --- LOGIQUE MÉTIER ---
+function parseFocusPoints(rawValue) {
+  return String(rawValue)
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .map((entry) => {
+      const [rawX, rawY] = entry.split(":").map((part) => Number(part.trim()));
+
+      if (!Number.isFinite(rawX) || !Number.isFinite(rawY)) {
+        return null;
+      }
+
+      return { x: rawX, y: rawY };
+    })
+    .filter(Boolean);
+}
+
+function requireConfig() {
+  if (!API_URL) {
+    throw new Error("API_URL manquant dans .env");
+  }
+
+  if (!TOKEN) {
+    throw new Error("TOKEN manquant dans .env");
+  }
+
+  if (!TEAM_ID) {
+    throw new Error("TEAM_ID manquant dans .env");
+  }
+}
 
 function getDistance(x1, y1, x2, y2) {
-  return Math.max(Math.abs(x1 - x2), Math.abs(y1 - y2)); // Distance de Chebyshev (déplacement en grille)
+  return Math.max(Math.abs(x1 - x2), Math.abs(y1 - y2));
 }
 
-async function gererVaisseau(vaisseau, mapCases, ennemis, occupiedSet, mapLookup) {
-  if (!vaisseau) return;
+function getCellKey(x, y) {
+  return `${Number(x)},${Number(y)}`;
+}
 
-  console.log(`🤖 Gestion de ${vaisseau.nom} (${vaisseau.coord_x}, ${vaisseau.coord_y})`);
+function getTargetKey(target) {
+  return `${target.type}:${target.id ?? getCellKey(target.x, target.y)}`;
+}
 
-  // S'assurer que les coordonnées sont bien des nombres pour éviter le bug "30" + 1 = "301"
-  const vX = parseInt(vaisseau.coord_x, 10);
-  const vY = parseInt(vaisseau.coord_y, 10);
+function getShipLabel(ship) {
+  return `${ship.nom} [${String(ship.idVaisseau).slice(0, 6)}]`;
+}
 
-  // Vérifier si le vaisseau est en repos forcé
-  if (cooldowns[vaisseau.idVaisseau]) {
-    const now = Date.now();
-    if (now < cooldowns[vaisseau.idVaisseau]) {
-      return; // On passe au tour suivant sans rien faire pour ce vaisseau
-    }
+function isCombatShip(ship) {
+  const shipClass = String(ship?.classe ?? ship?.type ?? "");
+  return (
+    shipClass.includes("CHASSEUR") ||
+    shipClass.includes("CROISEUR") ||
+    shipClass.includes("AMIRAL")
+  );
+}
+
+function hasMeaningfulOwner(value) {
+  if (!value) {
+    return false;
   }
 
-  // 1. Identifier les cibles potentielles (Planètes ennemies/neutres ou Vaisseaux ennemis)
-  // On extrait les planètes de la map qui ne sont pas à nous
-  const planetesCibles = mapCases
-    .filter(c => c.planete && c.planete.proprietaire?.idEquipe !== vaisseau.proprietaire && c.planete.proprietaire?.id !== vaisseau.proprietaire && c.planete.proprietaire?.nom !== 'PozClope' && c.planete.proprietaire?.nom !== 'Sudo Win')
-    .map(c => ({
-      id: c.planete.idPlanete,
-      x: c.coord_x,
-      y: c.coord_y,
-      hp: c.planete.pointDeVie || 0, // Assumons que l'API renvoie les HP
-      type: 'Planete',
-      equipe: c.planete.proprietaire?.nom || 'Inconnue'
-    }));
+  if (typeof value === "string") {
+    return value.trim().length > 0;
+  }
 
-  const vaisseauxCibles = ennemis.map(e => ({
-    id: e.idVaisseau,
-    x: e.coord_x,
-    y: e.coord_y,
-    hp: e.pointDeVie,
-    type: 'Vaisseau',
-    equipe: e.equipe
-  }));
+  return Boolean(value.nom || value.identifiant || value.idEquipe || value.id);
+}
 
-  const toutesCibles = [...planetesCibles, ...vaisseauxCibles];
+function getOwnerName(owner, teamLookup) {
+  if (!owner) {
+    return null;
+  }
 
-  if (toutesCibles.length === 0) {
-    console.log(`- Pas de cible visible pour ${vaisseau.nom}`);
+  if (typeof owner === "string") {
+    return teamLookup[owner] || owner;
+  }
+
+  return owner.nom || null;
+}
+
+function cleanupExpiringMap(store) {
+  const now = Date.now();
+
+  for (const [key, until] of store.entries()) {
+    if (until <= now) {
+      store.delete(key);
+    }
+  }
+}
+
+function parseAvailabilityDate(message) {
+  const match = String(message ?? "").match(/(\d{2}):(\d{2}):(\d{2})/);
+
+  if (!match) {
+    return null;
+  }
+
+  const [, hours, minutes, seconds] = match;
+  const now = new Date();
+  const target = new Date(now);
+  target.setHours(Number(hours), Number(minutes), Number(seconds), 0);
+
+  if (target.getTime() < now.getTime()) {
+    target.setDate(target.getDate() + 1);
+  }
+
+  return target;
+}
+
+function updateCooldownOverride(shipId, errorMessage) {
+  const availabilityDate = parseAvailabilityDate(errorMessage);
+
+  if (!availabilityDate) {
     return;
   }
 
-  // 2. Trouver la cible la plus proche
-  toutesCibles.sort((a, b) => {
-    const distA = getDistance(vX, vY, a.x, a.y);
-    const distB = getDistance(vX, vY, b.x, b.y);
-    return distA - distB;
+  cooldownOverrides.set(shipId, availabilityDate.getTime() + 1000);
+}
+
+function markFailedMove(shipId, x, y, durationMs = 15000) {
+  failedMoves.set(`${shipId},${x},${y}`, Date.now() + durationMs);
+}
+
+function isFailedMove(shipId, x, y) {
+  const key = `${shipId},${x},${y}`;
+  const blockedUntil = failedMoves.get(key);
+
+  if (!blockedUntil) {
+    return false;
+  }
+
+  if (blockedUntil <= Date.now()) {
+    failedMoves.delete(key);
+    return false;
+  }
+
+  return true;
+}
+
+async function apiPost(pathname, body) {
+  const response = await fetch(`${API_URL}${pathname}`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${TOKEN}`,
+      Accept: "application/json",
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(body)
   });
 
-  const cible = toutesCibles[0];
-  const distance = getDistance(vX, vY, cible.x, cible.y);
+  const rawText = await response.text();
+  const data = tryParseJson(rawText);
 
-  // LOG: Afficher la cible choisie
-  console.log(`   🎯 Cible : ${cible.type} [${cible.id.slice(0, 5)}] de l'équipe "${cible.equipe}" à (${cible.x}, ${cible.y}) - HP: ${cible.hp}`);
+  if (!response.ok) {
+    const message = data?.message || data?.error || rawText || `Erreur ${response.status}`;
+    const error = new Error(`${response.status} ${message}`);
+    error.status = response.status;
+    error.details = data ?? rawText;
+    throw error;
+  }
 
-  // 3. Décider de l'action
-  // Le vaisseau attaque s'il est adjacent (distance 1).
-  // Suite à votre demande, on tente aussi l'attaque à distance 2 pour arrêter de boucler sur des déplacements impossibles quand le vaisseau est proche mais bloqué.
-  if (distance <= 2) {
-    if (cible.type === 'Planete' && cible.hp <= 0) {
-      // CONQUÊTE
-      await actionConquerir(vaisseau.idVaisseau, cible.x, cible.y);
-    } else {
-      // ATTAQUE (Vaisseau ou Planète avec HP)
-      await actionAttaquer(vaisseau.idVaisseau, cible.x, cible.y);
+  return data ?? rawText;
+}
+
+async function apiGet(pathname) {
+  const response = await fetch(`${API_URL}${pathname}`, {
+    headers: {
+      Authorization: `Bearer ${TOKEN}`,
+      Accept: "application/json"
     }
-  } else {
-    // MOUVEMENT : Avancer d'une case vers la cible
-    // Stratégie "Pathfinding Local" (Inspiré de siege.js)
-    // On regarde les 8 cases autour et on prend la meilleure valide qui rapproche de la cible.
+  });
 
-    const candidates = [];
-    for (let dx = -1; dx <= 1; dx++) {
-      for (let dy = -1; dy <= 1; dy++) {
-        if (dx === 0 && dy === 0) continue;
-        candidates.push({ x: vX + dx, y: vY + dy });
-      }
+  const rawText = await response.text();
+  const data = tryParseJson(rawText);
+
+  if (!response.ok) {
+    const message = data?.message || data?.error || rawText || `Erreur ${response.status}`;
+    const error = new Error(`${response.status} ${message}`);
+    error.status = response.status;
+    error.details = data ?? rawText;
+    throw error;
+  }
+
+  return data ?? rawText;
+}
+
+function tryParseJson(value) {
+  if (!value) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
+
+async function sendShipAction(shipId, action, x, y) {
+  return apiPost(`/equipes/${TEAM_ID}/vaisseaux/${shipId}/demander-action`, {
+    action,
+    coord_x: Number(x),
+    coord_y: Number(y)
+  });
+}
+
+async function getMyShipStates() {
+  const payload = await apiGet(`/equipes/${TEAM_ID}/vaisseaux`);
+
+  if (!Array.isArray(payload)) {
+    return [];
+  }
+
+  return payload.map((ship) => ({
+    idVaisseau: ship.idVaisseau ?? ship.id,
+    nom: ship.nom ?? "Sans nom",
+    coord_x: Number(ship.positionX ?? ship.coord_x ?? ship.x ?? 0),
+    coord_y: Number(ship.positionY ?? ship.coord_y ?? ship.y ?? 0),
+    cooldown: ship.cooldown ?? ship.dateProchaineAction ?? 0,
+    pointDeVie: Number(ship.pointDeVie ?? 0),
+    proprietaire: ship.proprietaire ?? TEAM_ID,
+    classe:
+      ship.type?.classeVaisseau ??
+      ship.modeleVaisseau?.classeVaisseau ??
+      ship.classeVaisseau ??
+      ship.type?.nom ??
+      "INCONNU",
+    type: ship.type?.nom ?? ship.modeleVaisseau?.nom ?? null
+  }));
+}
+
+function buildTeamLookup(equipes) {
+  return Object.fromEntries(equipes.map((equipe) => [equipe.idEquipe, equipe.nom]));
+}
+
+function extractShipsFromMap(mapCases, teamLookup) {
+  return mapCases
+    .filter((cell) => cell.vaisseau)
+    .map((cell) => ({
+      idVaisseau: cell.vaisseau.idVaisseau,
+      nom: cell.vaisseau.nom,
+      equipe: teamLookup[cell.vaisseau.proprietaire] || "Inconnu",
+      proprietaire: cell.vaisseau.proprietaire,
+      coord_x: Number(cell.coord_x),
+      coord_y: Number(cell.coord_y),
+      pointDeVie: Number(cell.vaisseau.pointDeVie ?? 0),
+      type: cell.vaisseau.type?.nom ?? null,
+      classe: cell.vaisseau.type?.classeVaisseau ?? null
+    }));
+}
+
+function mergeMyShips(visibleShips, myShipStates) {
+  const byId = new Map(myShipStates.map((ship) => [ship.idVaisseau, ship]));
+
+  return visibleShips.map((ship) => {
+    const details = byId.get(ship.idVaisseau);
+
+    if (!details) {
+      return {
+        ...ship,
+        cooldown: 0
+      };
     }
 
-    // Filtrer les candidats valides
-    const validMoves = candidates.filter(pos => {
-      // 1. Limites de la carte (0-57)
-      if (pos.x < 0 || pos.x > 57 || pos.y < 0 || pos.y > 57) return false;
+    return {
+      ...ship,
+      coord_x: details.coord_x,
+      coord_y: details.coord_y,
+      cooldown: details.cooldown,
+      pointDeVie: details.pointDeVie || ship.pointDeVie
+    };
+  });
+}
 
-      const key = `${pos.x},${pos.y}`;
+function selectAttackShips(visibleShips, myShipStates) {
+  const myVisibleShips = visibleShips.filter((ship) => ship.equipe === MY_TEAM_NAME);
+  const mergedShips = mergeMyShips(myVisibleShips, myShipStates).filter(isCombatShip);
 
-      // 2. Vaisseaux (Amis ou Ennemis)
-      if (occupiedSet.has(key)) return false;
+  if (ATTACK_SHIP_IDS.size > 0) {
+    return mergedShips.filter((ship) => ATTACK_SHIP_IDS.has(ship.idVaisseau));
+  }
 
-      // 3. Mouvements récemment échoués (Failed Moves)
-      if (failedMoves.has(`${vaisseau.idVaisseau},${pos.x},${pos.y}`)) return false;
+  if (ATTACK_SHIP_NAMES.size > 0) {
+    return mergedShips.filter((ship) => ATTACK_SHIP_NAMES.has(normalizeText(ship.nom)));
+  }
 
-      // 4. Obstacles statiques (Astéroïdes, Planètes)
-      const cell = mapLookup.get(key);
-      
-      // Si la cellule existe (contient quelque chose), on vérifie si c'est un obstacle
-      if (cell) {
-        // Note : On autorise le passage sur les planètes (si c'est interdit, le serveur renverra une erreur capturée par failedMoves)
-        
-        if (cell.type === "ASTEROIDE" || (cell.type && cell.type.nom === "Astéroïde")) return false;
-      }
-      // Si cell est undefined, c'est du vide, donc c'est TRAVERSABLE (return true par défaut à la fin)
+  return mergedShips;
+}
 
-      return true;
-    });
+function getEffectiveCooldownDelay(ship) {
+  let delay = 0;
 
-    // Trier par distance restante vers la cible (le plus petit est le meilleur)
-    validMoves.sort((a, b) => {
-      const distA = getDistance(a.x, a.y, cible.x, cible.y);
-      const distB = getDistance(b.x, b.y, cible.x, cible.y);
-      return distA - distB;
-    });
+  const rawCooldown = ship.cooldown;
 
-    if (validMoves.length > 0) {
-      const bestMove = validMoves[0];
-      console.log(`- Déplacement vers ${cible.type} (${cible.x},${cible.y}) -> Go (${bestMove.x},${bestMove.y})`);
-      await actionDeplacer(vaisseau.idVaisseau, bestMove.x, bestMove.y);
-    } else {
-      console.log(`   ⛔ Mouvement impossible : bloqué de tous les côtés.`);
-      console.log(`   🔍 Scan des alentours pour debug (${vX},${vY}) :`);
-      for (let dx = -1; dx <= 1; dx++) {
-        for (let dy = -1; dy <= 1; dy++) {
-          if (dx === 0 && dy === 0) continue;
-          const tx = vX + dx;
-          const ty = vY + dy;
-          const key = `${tx},${ty}`;
-          let status = "✅ LIBRE";
+  if (typeof rawCooldown === "number" && Number.isFinite(rawCooldown)) {
+    delay = Math.max(rawCooldown * 1000, 0);
+  } else if (rawCooldown) {
+    const parsed = new Date(rawCooldown);
 
-          if (tx < 0 || tx > 57 || ty < 0 || ty > 57) status = "🚫 HORS MAP";
-          else if (occupiedSet.has(key)) status = "🚫 OCCUPÉ (Vaisseau/Astéroïde)";
-          else if (failedMoves.has(`${vaisseau.idVaisseau},${tx},${ty}`)) status = "🚫 LISTE NOIRE (Erreur précédente)";
-          else {
-            const c = mapLookup.get(key);
-            if (c && (c.type === "ASTEROIDE" || (c.type && c.type.nom === "Astéroïde"))) {
-                status = "🚫 ASTEROIDE (Non détecté par occupiedSet)";
-            } else if (c && c.planete) {
-                status = `⚠️ PLANETE (${c.planete.nom}) - Traversée autorisée`;
-            }
-          }
-          console.log(`      👉 (${tx},${ty}) : ${status}`);
-        }
-      }
+    if (Number.isFinite(parsed.getTime())) {
+      delay = Math.max(parsed.getTime() - Date.now(), 0);
     }
   }
+
+  const override = cooldownOverrides.get(ship.idVaisseau) ?? 0;
+  delay = Math.max(delay, override - Date.now());
+
+  if (delay <= 0) {
+    cooldownOverrides.delete(ship.idVaisseau);
+    return 0;
+  }
+
+  return delay;
+}
+
+function getFocusDistance(x, y) {
+  if (FOCUS_POINTS.length === 0) {
+    return 0;
+  }
+
+  return Math.min(...FOCUS_POINTS.map((point) => getDistance(x, y, point.x, point.y)));
+}
+
+function pickNearestFocusPoint(ship) {
+  if (FOCUS_POINTS.length === 0) {
+    return null;
+  }
+
+  return [...FOCUS_POINTS].sort(
+    (left, right) =>
+      getDistance(ship.coord_x, ship.coord_y, left.x, left.y) -
+      getDistance(ship.coord_x, ship.coord_y, right.x, right.y)
+  )[0];
+}
+
+function buildTargets(mapCases, visibleShips, teamLookup) {
+  const enemyShips = visibleShips
+    .filter((ship) => !ALLIED_TEAMS.has(ship.equipe))
+    .map((ship) => ({
+      id: ship.idVaisseau,
+      type: "Vaisseau",
+      x: ship.coord_x,
+      y: ship.coord_y,
+      hp: ship.pointDeVie || 0,
+      equipe: ship.equipe,
+      focusDistance: getFocusDistance(ship.coord_x, ship.coord_y)
+    }));
+
+  const enemyPlanets = mapCases
+    .filter((cell) => cell.planete && hasMeaningfulOwner(cell.proprietaire))
+    .map((cell) => ({
+      id: cell.planete.identifiant,
+      type: "Planete",
+      x: Number(cell.coord_x),
+      y: Number(cell.coord_y),
+      hp: Number(cell.planete.pointDeVie ?? 0),
+      equipe: getOwnerName(cell.proprietaire, teamLookup),
+      capital:
+        cell.planete.modules?.some(
+          (module) =>
+            module?.paramModule?.typeModule === "GOUVERNANCE_PLANETAIRE" ||
+            module?.typeModule === "GOUVERNANCE_PLANETAIRE"
+        ) ?? false,
+      focusDistance: getFocusDistance(cell.coord_x, cell.coord_y)
+    }))
+    .filter((planet) => planet.equipe && !ALLIED_TEAMS.has(planet.equipe));
+
+  return [...enemyShips, ...enemyPlanets];
+}
+
+function isTargetStillValid(target, targets) {
+  return targets.some((entry) => getTargetKey(entry) === getTargetKey(target));
+}
+
+function scoreTarget(target, myShips) {
+  const closestShipDistance = Math.min(
+    ...myShips.map((ship) => getDistance(ship.coord_x, ship.coord_y, target.x, target.y))
+  );
+
+  const inFocusZone = FOCUS_POINTS.length === 0 || target.focusDistance <= FOCUS_RADIUS;
+  let score = 0;
+
+  if (inFocusZone) {
+    score += 100000;
+  }
+
+  if (target.type === "Vaisseau") {
+    score += 30000;
+  } else if (!target.capital) {
+    score += 8000;
+  } else {
+    score -= 60000;
+  }
+
+  score -= closestShipDistance * 800;
+  score -= target.focusDistance * 400;
+  score -= target.hp;
+
+  return score;
+}
+
+function chooseGlobalTarget(currentTarget, targets, myShips) {
+  if (currentTarget && isTargetStillValid(currentTarget, targets)) {
+    return currentTarget;
+  }
+
+  if (targets.length === 0) {
+    return null;
+  }
+
+  return [...targets].sort((left, right) => scoreTarget(right, myShips) - scoreTarget(left, myShips))[0];
+}
+
+function buildOccupiedSet(mapCases, visibleShips, ignoreShipId = null) {
+  const occupied = new Set();
+
+  for (const ship of visibleShips) {
+    if (ship.idVaisseau === ignoreShipId) {
+      continue;
+    }
+
+    occupied.add(getCellKey(ship.coord_x, ship.coord_y));
+  }
+
+  for (const cell of mapCases) {
+    const terrainType = cell.type?.nom ?? cell.type ?? null;
+
+    if (terrainType === "ASTEROIDE" || terrainType === "Astéroïde") {
+      occupied.add(getCellKey(cell.coord_x, cell.coord_y));
+    }
+  }
+
+  return occupied;
+}
+
+function isPassableMove(cell, target = null) {
+  if (!cell) {
+    return true;
+  }
+
+  if (target && cell.coord_x === target.x && cell.coord_y === target.y) {
+    return false;
+  }
+
+  const terrainType = cell.type?.nom ?? cell.type ?? null;
+
+  if (terrainType === "ASTEROIDE" || terrainType === "Astéroïde") {
+    return false;
+  }
+
+  if (cell.planete) {
+    return false;
+  }
+
+  return true;
+}
+
+function buildAdjacentCandidates(x, y) {
+  const candidates = [];
+
+  for (let dx = -1; dx <= 1; dx += 1) {
+    for (let dy = -1; dy <= 1; dy += 1) {
+      if (dx === 0 && dy === 0) {
+        continue;
+      }
+
+      const tx = x + dx;
+      const ty = y + dy;
+
+      if (tx < 0 || tx >= 58 || ty < 0 || ty >= 58) {
+        continue;
+      }
+
+      candidates.push({ x: tx, y: ty });
+    }
+  }
+
+  return candidates;
+}
+
+function chooseBestMove(ship, destination, occupiedSet, mapLookup, target = null) {
+  const candidates = buildAdjacentCandidates(ship.coord_x, ship.coord_y)
+    .filter((candidate) => {
+      if (occupiedSet.has(getCellKey(candidate.x, candidate.y))) {
+        return false;
+      }
+
+      if (isFailedMove(ship.idVaisseau, candidate.x, candidate.y)) {
+        return false;
+      }
+
+      return isPassableMove(mapLookup.get(getCellKey(candidate.x, candidate.y)), target);
+    })
+    .sort((left, right) => {
+      const leftDistance = getDistance(left.x, left.y, destination.x, destination.y);
+      const rightDistance = getDistance(right.x, right.y, destination.x, destination.y);
+      return leftDistance - rightDistance;
+    });
+
+  return candidates[0] ?? null;
+}
+
+function chooseAttackStagingCell(ship, target, occupiedSet, mapLookup) {
+  const candidates = buildAdjacentCandidates(target.x, target.y)
+    .filter((candidate) => {
+      if (occupiedSet.has(getCellKey(candidate.x, candidate.y))) {
+        return false;
+      }
+
+      return isPassableMove(mapLookup.get(getCellKey(candidate.x, candidate.y)), target);
+    })
+    .sort((left, right) => {
+      const leftDistance = getDistance(ship.coord_x, ship.coord_y, left.x, left.y);
+      const rightDistance = getDistance(ship.coord_x, ship.coord_y, right.x, right.y);
+      return leftDistance - rightDistance;
+    });
+
+  return candidates[0] ?? null;
+}
+
+async function actionDeplacer(ship, x, y) {
+  try {
+    await sendShipAction(ship.idVaisseau, "DEPLACEMENT", x, y);
+    log(`${getShipLabel(ship)} se deplace vers (${x}, ${y})`);
+    return true;
+  } catch (error) {
+    updateCooldownOverride(ship.idVaisseau, error.message);
+
+    if (
+      error.message.includes("inaccessible") ||
+      error.message.includes("obstacle") ||
+      error.message.includes("Case cible") ||
+      error.message.startsWith("400") ||
+      error.message.startsWith("403")
+    ) {
+      markFailedMove(ship.idVaisseau, x, y);
+    }
+
+    log(`${getShipLabel(ship)} deplacement refuse: ${error.message}`);
+    return false;
+  }
+}
+
+async function actionAttaquer(ship, target) {
+  try {
+    await sendShipAction(ship.idVaisseau, "ATTAQUER", target.x, target.y);
+    log(`${getShipLabel(ship)} attaque ${target.type} ${target.equipe} en (${target.x}, ${target.y})`);
+    return true;
+  } catch (error) {
+    updateCooldownOverride(ship.idVaisseau, error.message);
+    log(`${getShipLabel(ship)} attaque refusee: ${error.message}`);
+    return false;
+  }
+}
+
+async function actionConquerir(ship, target) {
+  try {
+    await sendShipAction(ship.idVaisseau, "CONQUERIR", target.x, target.y);
+    log(`${getShipLabel(ship)} conquiert ${target.type} en (${target.x}, ${target.y})`);
+    return true;
+  } catch (error) {
+    updateCooldownOverride(ship.idVaisseau, error.message);
+    log(`${getShipLabel(ship)} conquete refusee: ${error.message}`);
+    return false;
+  }
+}
+
+async function gererVaisseau(ship, currentTarget, mapCases, visibleShips) {
+  const shipLabel = getShipLabel(ship);
+  const cooldownDelay = getEffectiveCooldownDelay(ship);
+
+  if (cooldownDelay > 0) {
+    log(`${shipLabel} attend encore ${Math.ceil(cooldownDelay / 1000)}s`);
+    return false;
+  }
+
+  const occupiedSet = buildOccupiedSet(mapCases, visibleShips, ship.idVaisseau);
+  const mapLookup = new Map(mapCases.map((cell) => [getCellKey(cell.coord_x, cell.coord_y), cell]));
+
+  if (!currentTarget) {
+    const focusPoint = pickNearestFocusPoint(ship);
+
+    if (!focusPoint) {
+      log(`${shipLabel} n'a aucune cible ni coordonnee de focus.`);
+      return false;
+    }
+
+    const move = chooseBestMove(ship, focusPoint, occupiedSet, mapLookup);
+
+    if (!move) {
+      log(`${shipLabel} ne trouve aucun chemin vers le focus (${focusPoint.x}, ${focusPoint.y}).`);
+      return false;
+    }
+
+    return actionDeplacer(ship, move.x, move.y);
+  }
+
+  const distanceToTarget = getDistance(ship.coord_x, ship.coord_y, currentTarget.x, currentTarget.y);
+
+  if (distanceToTarget <= ATTACK_RANGE) {
+    if (currentTarget.type === "Planete" && currentTarget.hp <= 0 && CONQUER_PLANETS) {
+      return actionConquerir(ship, currentTarget);
+    }
+
+    return actionAttaquer(ship, currentTarget);
+  }
+
+  const stage = chooseAttackStagingCell(ship, currentTarget, occupiedSet, mapLookup);
+  const destination = stage ?? { x: currentTarget.x, y: currentTarget.y };
+  const move = chooseBestMove(ship, destination, occupiedSet, mapLookup, currentTarget);
+
+  if (!move) {
+    log(`${shipLabel} est bloque autour de (${ship.coord_x}, ${ship.coord_y}).`);
+    return false;
+  }
+
+  return actionDeplacer(ship, move.x, move.y);
 }
 
 async function main() {
-  console.log("🚀 Démarrage du script d'attaque...");
+  requireConfig();
+
+  if (FOCUS_POINTS.length === 0) {
+    log("Aucune coordonnee de focus configuree. Ajoute ATTACK_FOCUS_POINTS=x:y,x:y dans le .env.");
+  } else {
+    log(`Focus trade: ${FOCUS_POINTS.map((point) => `(${point.x},${point.y})`).join(" ")}`);
+  }
+
   while (true) {
-    console.log("\n--- Nouveau tour ---");
-    
-    // Récupérer la map une seule fois
+    cleanupExpiringMap(cooldownOverrides);
+    cleanupExpiringMap(failedMoves);
+
+    const equipes = await getEquipes();
+    const teamLookup = buildTeamLookup(equipes);
     const mapCases = await getFullMap();
+    const visibleShips = extractShipsFromMap(mapCases, teamLookup);
+    const myShipStates = await getMyShipStates();
+    const attackShips = selectAttackShips(visibleShips, myShipStates);
+    const targets = buildTargets(mapCases, visibleShips, teamLookup);
+    const currentTarget = chooseGlobalTarget(
+      targets.find((target) => getTargetKey(target) === stickyTargetKey) ?? null,
+      targets,
+      attackShips
+    );
 
-    // Créer un lookup rapide pour les obstacles statiques (Planètes, Astéroïdes)
-    const mapLookup = new Map(mapCases.map(c => [`${c.coord_x},${c.coord_y}`, c]));
+    stickyTargetKey = currentTarget ? getTargetKey(currentTarget) : null;
 
-    // Utiliser getAllVaisseaux avec la map déjà téléchargée pour trier tout le monde
-    const tousLesVaisseaux = await getAllVaisseaux(mapCases);
+    log("--- Nouveau tour ---");
+    log(`Flotte d'attaque: ${attackShips.map((ship) => getShipLabel(ship)).join(", ") || "aucune"}`);
 
-    // Filtrer mes vaisseaux
-    const mesVaisseaux = tousLesVaisseaux.filter(v => MES_VAISSEAUX_IDS.includes(v.idVaisseau));
-    
-    // Filtrer les ennemis (tous ceux qui ne sont pas dans ma liste d'IDs)
-    // On exclut aussi les vaisseaux de la même équipe si nécessaire, mais ici on se base sur les IDs. On exclut aussi l'équipe "PozClope".
-    const ennemis = tousLesVaisseaux.filter(v => !MES_VAISSEAUX_IDS.includes(v.idVaisseau) && v.equipe !== 'PozClope' && v.equipe !== 'Sudo Win');
-    
-    // Construire une carte des obstacles (positions des autres vaisseaux)
-    const occupiedSet = new Set();
-    tousLesVaisseaux.forEach(v => {
-        occupiedSet.add(`${v.coord_x},${v.coord_y}`);
-    });
-    // Ajouter aussi les astéroïdes si possible (dépend de la structure de mapCases)
-    mapCases.forEach(c => {
-        // Supposons que c.type contient le type de terrain. Si "Astéroïde" ou autre obstacle :
-        if (c.type && (c.type === "ASTEROIDE" || c.type.nom === "Astéroïde")) {
-            occupiedSet.add(`${c.coord_x},${c.coord_y}`);
-        }
-    });
-
-    // Pour le debug, on garde la liste complète
-    const tousLesVaisseauxVisibles = tousLesVaisseaux;
-
-    if (mesVaisseaux.length === 0) {
-      console.log("⚠️ AUCUN de vos vaisseaux spécifiés n'a été trouvé !");
-      console.log("Voici la liste des vaisseaux visibles (copiez les IDs corrects) :");
-      tousLesVaisseauxVisibles.forEach(v => {
-        console.log(`- ${v.nom} [ID: ${v.idVaisseau}] à (${v.coord_x}, ${v.coord_y})`);
-      });
+    if (currentTarget) {
+      log(
+        `Focus: ${currentTarget.type} ${currentTarget.equipe} en (${currentTarget.x}, ${currentTarget.y}) | HP ${currentTarget.hp} | distance focus ${currentTarget.focusDistance}`
+      );
     } else {
-      console.log(`✅ ${mesVaisseaux.length} vaisseau(x) prêt(s) à l'action.`);
+      log("Aucune cible ennemie visible. Deplacement vers la zone de trade.");
     }
 
-    // Exécuter la logique pour mes vaisseaux en PARALLÈLE
-    await Promise.all(mesVaisseaux.map(v => gererVaisseau(v, mapCases, ennemis, occupiedSet, mapLookup)));
-
-    // --- GESTION INTELLIGENTE DU TEMPS D'ATTENTE ---
-    const now = Date.now();
-    let allWaiting = true;
-    let earliestWakeUp = Infinity;
-
-    // On regarde si au moins un vaisseau est prêt
-    for (const v of mesVaisseaux) {
-      const cd = cooldowns[v.idVaisseau] || 0;
-      if (cd <= now) {
-        allWaiting = false; // Un vaisseau est prêt, on boucle vite !
-        break;
-      }
-      if (cd < earliestWakeUp) earliestWakeUp = cd;
+    if (attackShips.length === 0) {
+      log("Aucun vaisseau de combat selectionne.");
+      await sleep(LOOP_DELAY_MS);
+      continue;
     }
 
-    let waitTime = DELAY_MS;
-    if (mesVaisseaux.length > 0 && allWaiting && earliestWakeUp !== Infinity) {
-      waitTime = Math.max(DELAY_MS, earliestWakeUp - now);
-      console.log(`💤 Tous les vaisseaux se reposent. Pause optimisée de ${(waitTime / 1000).toFixed(1)}s...`);
+    const results = await Promise.all(
+      attackShips.map((ship) => gererVaisseau(ship, currentTarget, mapCases, visibleShips))
+    );
+
+    if (!results.some(Boolean)) {
+      log("Aucune action utile ce tour.");
     }
 
-    await new Promise(r => setTimeout(r, waitTime));
+    await sleep(LOOP_DELAY_MS);
   }
 }
 
-main();
+main().catch((error) => {
+  console.error(error.message);
+  process.exit(1);
+});

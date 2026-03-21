@@ -12,6 +12,7 @@
     "game": "node scripts/game.js",
     "getmodel": "node scripts/getmodel.js",
     "socket-watch": "node scripts/socket-watch.js",
+    "scrap": "node scripts/scrap-ships.js",
     "siege": "node scripts/siege.js",
     "siege:auto": "node scripts/siege-plus.js",
     "rally": "node scripts/rally-combat.js",
