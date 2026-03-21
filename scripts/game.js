@@ -603,10 +603,12 @@ function printUsage() {
   console.log("npm.cmd run game -- build-options");
   console.log('npm.cmd run game -- buy-offer "uuid-offre"');
   console.log('npm.cmd run game -- buy-cargo-plan');
+  console.log('npm.cmd run game -- buy-fighter-plan');
   console.log('npm.cmd run game -- buy-advanced-yard');
   console.log('npm.cmd run game -- place-advanced-yard "Nom Planete"');
   console.log('npm.cmd run game -- buy-cargo-medium-plan');
   console.log('npm.cmd run game -- build-cargo "Cargo 1"');
+  console.log('npm.cmd run game -- build-fighter "Chasseur 2"');
   console.log('npm.cmd run game -- build-cargo-medium "Cargo M 1"');
   console.log('npm.cmd run game -- move "Chasseur leger 0" 6 40');
   console.log('npm.cmd run game -- harvest "Chasseur leger 0" 6 40');
@@ -807,6 +809,36 @@ async function run() {
     return;
   }
 
+  if (command === "build-fighter") {
+    const team = await getTeamState();
+    const constructibleFighter = getConstructibleShipTypes(team).find(
+      (type) => type.classeVaisseau === "CHASSEUR_LEGER"
+    );
+
+    if (!constructibleFighter) {
+      fail("Aucun CHASSEUR_LEGER constructible trouve.");
+    }
+
+    const marketTypes = extractMarketShipTypes(await getMarketOffers());
+    const fighterType = marketTypes.get("CHASSEUR_LEGER");
+
+    if (!fighterType) {
+      fail("Impossible de resoudre le vrai type.id du CHASSEUR_LEGER.");
+    }
+
+    const shipNameToBuild = shipName || `Chasseur ${Date.now()}`;
+    console.log(
+      `Construction de ${shipNameToBuild} sur ${constructibleFighter.planeteNom} (${fighterType.classeVaisseau})`
+    );
+    const result = await buildShip(
+      shipNameToBuild,
+      fighterType.identifiant,
+      constructibleFighter.planeteIdentifiant
+    );
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+
   if (command === "buy-advanced-yard") {
     const offers = await getMarketOffers();
     const moduleOffer = findCheapestModuleOffer(
@@ -927,6 +959,22 @@ async function run() {
       `Achat du plan cargo ${cargoOffer.idOffre} pour ${cargoOffer.prix} credits`
     );
     const result = await buyOffer(cargoOffer.idOffre);
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+
+  if (command === "buy-fighter-plan") {
+    const offers = await getMarketOffers();
+    const fighterOffer = findCheapestPlanOffer(offers, "CHASSEUR_LEGER");
+
+    if (!fighterOffer?.offerId) {
+      fail("Aucune offre de plan CHASSEUR_LEGER ouverte sur le marche.");
+    }
+
+    console.log(
+      `Achat du plan chasseur ${fighterOffer.offerId} pour ${fighterOffer.prix} credits`
+    );
+    const result = await buyOffer(fighterOffer.offerId);
     console.log(JSON.stringify(result, null, 2));
     return;
   }
