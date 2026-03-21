@@ -85,6 +85,20 @@ async function apiPost(pathname, body) {
   return handleResponse(response, { method: "POST", pathname, body });
 }
 
+async function apiPut(pathname, body) {
+  const response = await fetch(`${API_URL}${pathname}`, {
+    method: "PUT",
+    headers: {
+      Authorization: `Bearer ${await getAccessToken()}`,
+      Accept: "application/json",
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(body)
+  });
+
+  return handleResponse(response, { method: "PUT", pathname, body });
+}
+
 async function handleResponse(response, context) {
   const rawText = await response.text();
   const data = parseJson(rawText);
@@ -300,9 +314,14 @@ function normalizePlanet(planet) {
 }
 
 function normalizeShip(ship) {
+  const rawType =
+    ship.modeleVaisseau ??
+    ship.type ??
+    ship.modele ??
+    null;
   const rawClass =
-    ship.modeleVaisseau?.classeVaisseau ||
-    ship.modele?.classeVaisseau ||
+    rawType?.classeVaisseau ??
+    ship.classeVaisseau ??
     ship.type;
   const classLabel =
     typeof rawClass === "string"
@@ -313,10 +332,15 @@ function normalizeShip(ship) {
     id: ship.idVaisseau || ship.id,
     nom: ship.nom || ship.name || "Sans nom",
     classe: classLabel || "INCONNU",
+    classeVaisseau: classLabel || null,
+    typeId: rawType?.id ?? null,
+    typeNom:
+      rawType?.nom ??
+      (typeof rawType === "string" ? rawType : null),
     coord_x: ship.positionX ?? ship.coord_x ?? ship.x ?? 0,
     coord_y: ship.positionY ?? ship.coord_y ?? ship.y ?? 0,
     minerai: ship.mineraiTransporte ?? ship.minerai ?? 0,
-    cooldown: ship.cooldown ?? 0
+    cooldown: ship.cooldown ?? ship.dateProchaineAction ?? 0
   };
 }
 
@@ -327,6 +351,22 @@ async function getShips() {
 
 async function getTeam() {
   return apiGet(`/equipes/${TEAM_ID}`);
+}
+
+async function getPlans() {
+  return apiGet(`/equipes/${TEAM_ID}/plans`);
+}
+
+async function getMarketOffers() {
+  return apiGet("/market/offres");
+}
+
+async function getModules() {
+  return apiGet(`/equipes/${TEAM_ID}/modules`);
+}
+
+async function buyOffer(offerId) {
+  return apiGet(`/market/offres/${offerId}`);
 }
 
 function normalizeTeam(team) {
@@ -398,14 +438,201 @@ async function sendShipAction(shipId, action, x, y) {
   });
 }
 
+function getConstructibleShipTypes(team) {
+  const types = [];
+
+  for (const planet of team.planetes || []) {
+    for (const module of planet.modules || []) {
+      for (const type of module.listeVaisseauxConstructible || []) {
+        types.push({
+          identifiant: type.identifiant,
+          nom: type.nom,
+          classeVaisseau: type.classeVaisseau,
+          coutConstruction: type.coutConstruction,
+          planeteIdentifiant: planet.identifiant,
+          planeteNom: planet.nom
+        });
+      }
+    }
+  }
+
+  return types;
+}
+
+function extractMarketShipTypes(offers) {
+  const byClass = new Map();
+
+  for (const offer of extractArray(offers)) {
+    const plan =
+      offer.planVaisseau ?? offer.plan ?? offer.objet?.planVaisseau ?? offer.objet?.plan;
+    const type = plan?.typeVaisseau ?? null;
+
+    if (!type?.classeVaisseau || !type?.id) {
+      continue;
+    }
+
+    const current = byClass.get(type.classeVaisseau);
+
+    if (!current || Number(type.coutConstruction ?? 0) < Number(current.coutConstruction ?? 0)) {
+      byClass.set(type.classeVaisseau, {
+        identifiant: type.id,
+        nom: type.nom ?? null,
+        classeVaisseau: type.classeVaisseau,
+        coutConstruction: Number(type.coutConstruction ?? 0),
+        capaciteTransport: Number(type.capaciteTransport ?? 0)
+      });
+    }
+  }
+
+  return byClass;
+}
+
+async function buildShip(name, typeId, planetId) {
+  return apiPost(`/equipes/${TEAM_ID}/vaisseau/construire`, {
+    nom: name,
+    idTypeVaisseau: typeId,
+    idPlanete: planetId
+  });
+}
+
+async function placeModule(moduleId, planetId) {
+  return apiPut(`/equipes/${TEAM_ID}/module/${moduleId}/poser`, {
+    idModule: moduleId,
+    idPlanete: planetId
+  });
+}
+
+function findCheapestModuleOffer(offers, typeModule) {
+  return extractArray(offers)
+    .map((offer) => ({
+      offerId: offer.idOffre ?? offer.id ?? null,
+      prix: Number(offer.prix ?? 0),
+      module: offer.module ?? offer.objet?.module ?? null
+    }))
+    .filter((entry) => entry.offerId && entry.module?.paramModule?.typeModule === typeModule)
+    .sort((left, right) => left.prix - right.prix)[0] ?? null;
+}
+
+function findCheapestPlanOffer(offers, shipClass) {
+  return extractArray(offers)
+    .map((offer) => ({
+      offerId: offer.idOffre ?? offer.id ?? null,
+      prix: Number(offer.prix ?? 0),
+      plan:
+        offer.planVaisseau ??
+        offer.plan ??
+        offer.objet?.planVaisseau ??
+        offer.objet?.plan ??
+        null
+    }))
+    .filter((entry) => entry.offerId && entry.plan?.typeVaisseau?.classeVaisseau === shipClass)
+    .sort((left, right) => left.prix - right.prix)[0] ?? null;
+}
+
+function findOwnedModuleByType(modules, typeModule) {
+  return extractArray(modules).find((module) => {
+    const normalizedType = module?.paramModule?.typeModule ?? module?.typeModule ?? null;
+    return normalizedType === typeModule;
+  }) ?? null;
+}
+
+function findOwnedPlanByClass(plans, shipClass) {
+  return extractArray(plans).find((plan) => {
+    const normalizedClass = plan?.typeVaisseau?.classeVaisseau ?? null;
+    return normalizedClass === shipClass;
+  }) ?? null;
+}
+
+function resolveBuildTypeIdFromPlans(plans, shipClass) {
+  const ownedPlan = findOwnedPlanByClass(plans, shipClass);
+
+  if (!ownedPlan?.typeVaisseau?.id) {
+    return null;
+  }
+
+  return {
+    typeId: ownedPlan.typeVaisseau.id,
+    typeName: ownedPlan.typeVaisseau.nom ?? shipClass,
+    shipClass: ownedPlan.typeVaisseau.classeVaisseau ?? shipClass
+  };
+}
+
+function findBuildPlanet(team, acceptedModules) {
+  for (const planet of team.planetes || []) {
+    const hasShipyard = (planet.modules || []).some((module) =>
+      acceptedModules.includes(module.typeModule)
+    );
+
+    if (hasShipyard) {
+      return planet;
+    }
+  }
+
+  return null;
+}
+
+function findPlanetByName(team, planetName) {
+  if (!planetName) {
+    return null;
+  }
+
+  const normalized = normalizeText(planetName);
+
+  return (
+    (team.planetes || []).find((planet) => normalizeText(planet.nom) === normalized) ?? null
+  );
+}
+
+function findModulePlacementPlanet(team, slotsNeeded, preferredPlanetName = null) {
+  const preferredPlanet = findPlanetByName(team, preferredPlanetName);
+
+  if (preferredPlanet && Number(preferredPlanet.slotsConstruction ?? 0) >= slotsNeeded) {
+    return preferredPlanet;
+  }
+
+  return [...(team.planetes || [])]
+    .filter((planet) => Number(planet.slotsConstruction ?? 0) >= slotsNeeded)
+    .sort((left, right) => Number(right.slotsConstruction ?? 0) - Number(left.slotsConstruction ?? 0))[0] ?? null;
+}
+
 function printUsage() {
   console.log("Usage:");
   console.log("npm.cmd run game -- ships");
   console.log("npm.cmd run game -- team");
+  console.log("npm.cmd run game -- cell 5 40");
+  console.log("npm.cmd run game -- build-options");
+  console.log('npm.cmd run game -- buy-offer "uuid-offre"');
+  console.log('npm.cmd run game -- buy-cargo-plan');
+  console.log('npm.cmd run game -- buy-advanced-yard');
+  console.log('npm.cmd run game -- place-advanced-yard "Nom Planete"');
+  console.log('npm.cmd run game -- buy-cargo-medium-plan');
+  console.log('npm.cmd run game -- build-cargo "Cargo 1"');
+  console.log('npm.cmd run game -- build-cargo-medium "Cargo M 1"');
   console.log('npm.cmd run game -- move "Chasseur leger 0" 6 40');
   console.log('npm.cmd run game -- harvest "Chasseur leger 0" 6 40');
   console.log('npm.cmd run game -- deposit "Chasseur leger 0" 5 44');
   console.log('npm.cmd run game -- conquer "Chasseur leger 0" 6 40');
+}
+
+function printCell(cell) {
+  if (!cell) {
+    console.log("Case introuvable.");
+    return;
+  }
+
+  console.log(`Case (${cell.coord_x}, ${cell.coord_y})`);
+
+  if (!cell.planete) {
+    console.log("- Aucune planete");
+    return;
+  }
+
+  console.log(`- Planete: ${cell.planete.nom}`);
+  console.log(`- Proprietaire: ${cell.proprietaire?.nom ?? "aucun"}`);
+  console.log(`- PV: ${cell.planete.pointDeVie}`);
+  console.log(`- Minerai: ${cell.planete.mineraiDisponible}`);
+  console.log(`- Slots: ${cell.planete.slotsConstruction}`);
+  console.log(`- Type: ${cell.planete.typePlanete ?? "INCONNU"}`);
 }
 
 function printShips(ships) {
@@ -435,6 +662,21 @@ function printTeam(team) {
         : rawType?.typeRessource || rawType?.libelle || rawType?.nom || "INCONNU";
     const value = resource.quantite ?? resource.valeur ?? 0;
     console.log(`- ${type}: ${value}`);
+  }
+}
+
+function printBuildOptions(team) {
+  const types = getConstructibleShipTypes(team);
+
+  if (types.length === 0) {
+    console.log("Aucun type de vaisseau constructible trouve.");
+    return;
+  }
+
+  for (const type of types) {
+    console.log(
+      `- ${type.classeVaisseau} | planete ${type.planeteNom} | typeId ${type.identifiant}`
+    );
   }
 }
 
@@ -505,6 +747,190 @@ async function run() {
     return;
   }
 
+  if (command === "cell") {
+    const cellX = Number(shipName);
+    const cellY = Number(x);
+
+    if (!Number.isFinite(cellX) || !Number.isFinite(cellY)) {
+      fail("Il faut fournir x et y. Exemple: npm.cmd run game -- cell 5 40");
+    }
+
+    const [cell] = await getMap(cellX, cellX, cellY, cellY);
+    printCell(cell);
+    return;
+  }
+
+  if (command === "build-options") {
+    const team = await getTeamState();
+    printBuildOptions(team);
+    const marketTypes = extractMarketShipTypes(await getMarketOffers());
+
+    for (const type of getConstructibleShipTypes(team)) {
+      const resolvedType = marketTypes.get(type.classeVaisseau);
+
+      if (resolvedType) {
+        console.log(
+          `  -> type.id reel ${resolvedType.identifiant} | cout ${resolvedType.coutConstruction}`
+        );
+      }
+    }
+    return;
+  }
+
+  if (command === "build-cargo") {
+    const team = await getTeamState();
+    const constructibleCargo = getConstructibleShipTypes(team).find(
+      (type) => type.classeVaisseau === "CARGO_LEGER"
+    );
+
+    if (!constructibleCargo) {
+      fail("Aucun CARGO_LEGER constructible trouve.");
+    }
+
+    const marketTypes = extractMarketShipTypes(await getMarketOffers());
+    const cargoType = marketTypes.get("CARGO_LEGER");
+
+    if (!cargoType) {
+      fail("Impossible de resoudre le vrai type.id du CARGO_LEGER.");
+    }
+
+    const shipNameToBuild = shipName || `Cargo ${Date.now()}`;
+    console.log(
+      `Construction de ${shipNameToBuild} sur ${constructibleCargo.planeteNom} (${cargoType.classeVaisseau})`
+    );
+    const result = await buildShip(
+      shipNameToBuild,
+      cargoType.identifiant,
+      constructibleCargo.planeteIdentifiant
+    );
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+
+  if (command === "buy-advanced-yard") {
+    const offers = await getMarketOffers();
+    const moduleOffer = findCheapestModuleOffer(
+      offers,
+      "CONSTRUCTION_VAISSEAUX_AVANCEE"
+    );
+
+    if (!moduleOffer) {
+      fail("Aucune offre CONSTRUCTION_VAISSEAUX_AVANCEE ouverte sur le marche.");
+    }
+
+    console.log(
+      `Achat du module avance ${moduleOffer.offerId} pour ${moduleOffer.prix} credits`
+    );
+    const result = await buyOffer(moduleOffer.offerId);
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+
+  if (command === "place-advanced-yard") {
+    const [team, modules] = await Promise.all([getTeamState(), getModules()]);
+    const advancedModule = findOwnedModuleByType(
+      modules,
+      "CONSTRUCTION_VAISSEAUX_AVANCEE"
+    );
+
+    if (!advancedModule?.id && !advancedModule?.identifiant) {
+      fail("Module CONSTRUCTION_VAISSEAUX_AVANCEE introuvable dans vos modules.");
+    }
+
+    const planet = findModulePlacementPlanet(team, 2, shipName);
+
+    if (!planet?.identifiant) {
+      fail("Aucune planete avec au moins 2 slots libres disponible pour poser le module.");
+    }
+
+    const moduleId = advancedModule.id ?? advancedModule.identifiant;
+    console.log(`Pose du module avance sur ${planet.nom}`);
+    const result = await placeModule(moduleId, planet.identifiant);
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+
+  if (command === "buy-cargo-medium-plan") {
+    const offers = await getMarketOffers();
+    const cargoPlanOffer = findCheapestPlanOffer(offers, "CARGO_MOYEN");
+
+    if (!cargoPlanOffer) {
+      fail("Aucune offre de plan CARGO_MOYEN ouverte sur le marche.");
+    }
+
+    console.log(
+      `Achat du plan cargo moyen ${cargoPlanOffer.offerId} pour ${cargoPlanOffer.prix} credits`
+    );
+    const result = await buyOffer(cargoPlanOffer.offerId);
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+
+  if (command === "build-cargo-medium") {
+    const [team, plans] = await Promise.all([getTeamState(), getPlans()]);
+    const buildType = resolveBuildTypeIdFromPlans(plans, "CARGO_MOYEN");
+
+    if (!buildType?.typeId) {
+      fail("Vous ne possedez pas de plan CARGO_MOYEN.");
+    }
+
+    const buildPlanet = findBuildPlanet(team, [
+      "CONSTRUCTION_VAISSEAUX_AVANCEE"
+    ]);
+
+    if (!buildPlanet?.identifiant) {
+      fail("Aucune planete avec CONSTRUCTION_VAISSEAUX_AVANCEE disponible.");
+    }
+
+    const shipNameToBuild = shipName || `Cargo moyen ${Date.now()}`;
+    console.log(
+      `Construction de ${shipNameToBuild} sur ${buildPlanet.nom} (${buildType.shipClass})`
+    );
+    const result = await buildShip(
+      shipNameToBuild,
+      buildType.typeId,
+      buildPlanet.identifiant
+    );
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+
+  if (command === "buy-offer") {
+    if (!shipName) {
+      fail("Il faut fournir un id d'offre.");
+    }
+
+    console.log(`Achat de l'offre ${shipName}`);
+    const result = await buyOffer(shipName);
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+
+  if (command === "buy-cargo-plan") {
+    const offers = await getMarketOffers();
+    const cargoOffer = extractArray(offers).find((offer) => {
+      const plan =
+        offer.planVaisseau ??
+        offer.plan ??
+        offer.objet?.planVaisseau ??
+        offer.objet?.plan ??
+        null;
+
+      return plan?.typeVaisseau?.classeVaisseau === "CARGO_LEGER";
+    });
+
+    if (!cargoOffer?.idOffre) {
+      fail("Aucune offre de plan CARGO_LEGER ouverte sur le marche.");
+    }
+
+    console.log(
+      `Achat du plan cargo ${cargoOffer.idOffre} pour ${cargoOffer.prix} credits`
+    );
+    const result = await buyOffer(cargoOffer.idOffre);
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+
   const action = mapCommandToAction(command);
 
   if (!action) {
@@ -528,12 +954,18 @@ async function run() {
 }
 
 module.exports = {
+  buyOffer,
+  buildShip,
   findShipByName,
   getMap,
+  getMarketOffers,
+  getModules,
+  getPlans,
   getShips,
   getTeam,
   getTeamState,
   normalizeText,
+  placeModule,
   requireConfig,
   sendShipAction
 };
