@@ -717,7 +717,7 @@ function normalizeLeaderboardEntry(entry, index) {
     return null;
   }
 
-  const score = Number(
+  let score = Number(
     pickNestedValue(entry, [
       "score",
       "points",
@@ -729,6 +729,14 @@ function normalizeLeaderboardEntry(entry, index) {
       "victoryPoints"
     ])
   );
+
+  // Fallback if score wasn't found directly (Number(null) === 0)
+  if ((!Number.isFinite(score) || score === 0) && Array.isArray(entry.ressources)) {
+    const pointRes = entry.ressources.find(r => r.ressource?.nom === "POINT");
+    if (pointRes && pointRes.quantite !== undefined) {
+      score = Number(pointRes.quantite);
+    }
+  }
 
   if (!Number.isFinite(score)) {
     return null;
@@ -1160,18 +1168,8 @@ async function fetchLeaderboard() {
       continue;
     }
 
-    const leaderboard = result.payload
-      .filter(entry => entry.idEquipe)
-      .map(entry => ({
-        nom: entry.nom,
-        type: entry.type,
-        score: getScore(entry)
-      }))
-      .sort((a, b) => b.score - a.score)
-      .map((entry, index) => ({
-        rang: index + 1,
-        ...entry
-      }));
+    // Use the robust extraction function instead of manual mapping
+    const leaderboard = extractLeaderboard(result.payload);
 
     if (leaderboard.length) {
       cachedLeaderboardPath = pathname;
