@@ -51,15 +51,32 @@ body { margin: 0; background: var(--bg); color: var(--accent); font-family: 'Jet
 }
 .asset-img { width: 80%; filter: drop-shadow(0 0 10px var(--accent)); }
 
-/* FOG OF WAR: Solid black with a radial hole */
+/* FOG OF WAR: Radial gradient with a bright center glow */
 .fow-overlay {
   position: absolute;
   inset: 0;
   pointer-events: none;
-  z-index: 2;
-  background: rgba(0, 0, 0, 0.8);
-  mask-image: radial-gradient(circle 450px at var(--hole-x, 50%) var(--hole-y, 50%), transparent 20%, black 100%);
-  -webkit-mask-image: radial-gradient(circle 450px at var(--hole-x, 50%) var(--hole-y, 50%), transparent 20%, black 100%);
+  z-index: 5;
+  background: radial-gradient(
+    circle 450px at var(--hole-x) var(--hole-y), 
+    rgba(255, 0, 255, 0.15) 0%,   /* Bright magenta glow right on the ship */
+    transparent 25%,              /* Fully clear inner viewing area */
+    rgba(0, 0, 0, 0.85) 65%,      /* Starts getting dark */
+    rgba(0, 0, 0, 0.98) 100%      /* Pitch black edges */
+  );
+}
+
+.map-canvas {
+  /* ... keep your existing styles ... */
+  background-color: #0d000d; /* Slightly visible background so you know it's there */
+  position: absolute;
+}
+.asset-img {
+  width: 90%;
+  height: auto;
+  object-fit: contain;
+  filter: drop-shadow(0 0 5px var(--accent));
+  z-index: 10;
 }
 
 /* HUD PANELS */

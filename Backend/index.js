@@ -1,69 +1,75 @@
 require('dotenv').config();
+const express = require('express');
+const cors = require('cors');
 
-const AUTH_URL = process.env.AUTH_URL;
-const API_URL = process.env.API_URL;
+const app = express();
+app.use(cors());
+
 const TEAM_ID = process.env.TEAM_ID;
+const API_URL = process.env.API_URL;
+const TOKEN = process.env.TOKEN;
 
-// Configuration from your .env 
-const authConfig = {
-  realm: process.env.KEYCLOAK_REALM,
-  client_id: process.env.KEYCLOAK_CLIENT_ID,
-  username: process.env.KEYCLOAK_USERNAME,
-  password: process.env.KEYCLOAK_PASSWORD,
-  grant_type: 'password'
-};
+// This variable will hold the "injected" map data in memory
+let cachedMap = [];
 
-async function getFreshToken() {
-  const url = `${AUTH_URL}/realms/${authConfig.realm}/protocol/openid-connect/token`; // [cite: 7]
-  
-  const params = new URLSearchParams();
-  params.append('client_id', authConfig.client_id); // [cite: 9]
-  params.append('username', authConfig.username); // [cite: 10]
-  params.append('password', authConfig.password); // 
-  params.append('grant_type', 'password'); // [cite: 12]
+/**
+ * Fetches the 58x58 map in 18x18 chunks to avoid timeouts.
+ * This is the logic from your getMap.js script.
+ */
+async function fetchFullMap() {
+  const chunkSize = 18;
+  const size = 58;
+  let fullMap = [];
 
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, // [cite: 8]
-    body: params
-  });
-
-  if (!res.ok) throw new Error(`Auth failed: ${res.status}`);
-  
-  const data = await res.json();
-  return data.access_token; // 
-}
-
-async function apiGet(path, token) {
-  const res = await fetch(`${API_URL}${path}`, {
-    headers: {
-      'Authorization': `Bearer ${token}`, // [cite: 5, 6]
-      'Accept': "application/json"
-    }
-  });
-
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Erreur ${res.status} : ${text}`);
-  }
-
-  return res.json();
-}
-
-async function test() {
   try {
-    console.log("Fetching fresh token...");
-    const token = await getFreshToken();
-    
-    // Now use the fresh token for your requests [cite: 4]
-    const ships = await apiGet(`/equipes/${TEAM_ID}/vaisseaux`, token);
-    console.log("Mes vaisseaux :", ships);
-
-    const map = await apiGet(`/monde/map?x_range=0,10&y_range=40,50`, token);
-    console.log("Map sample loaded.");
+    for (let y = 0; y < size; y += chunkSize) {
+      for (let x = 0; x < size; x += chunkSize) {
+        const xEnd = Math.min(x + chunkSize - 1, size - 1);
+        const yEnd = Math.min(y + chunkSize - 1, size - 1);
+        
+        const res = await fetch(`${API_URL}/monde/map?x_range=${x},${xEnd}&y_range=${y},${yEnd}`, {
+          headers: { 'Authorization': `Bearer ${TOKEN}` }
+        });
+        
+        if (res.ok) {
+          const chunk = await res.json();
+          fullMap.push(...chunk);
+        }
+      }
+    }
+    cachedMap = fullMap;
+    console.log(`Map data injected: ${cachedMap.length} cells loaded.`);
   } catch (err) {
-    console.error("Erreur :", err.message);
+    console.error("Injection error:", err.message);
   }
 }
 
-test();
+// Perform initial map injection
+fetchFullMap();
+// Refresh the static map data every 5 minutes
+setInterval(fetchFullMap, 300000);
+
+/**
+ * Combined API endpoint for the frontend.
+ * Returns live ship positions and the cached map cells.
+ */
+app.get('/api/state', async (req, res) => {
+  try {
+    const shipRes = await fetch(`${API_URL}/equipes/${TEAM_ID}/vaisseaux`, {
+      headers: { 'Authorization': `Bearer ${TOKEN}` }
+    });
+    
+    if (!shipRes.ok) throw new Error("Could not fetch ships");
+    const ships = await shipRes.json();
+
+    res.json({
+      ships: ships, 
+      cells: cachedMap 
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+const PORT = 3000;
+app.listen(PORT, () => console.log(`Backend server active on http://localhost:${PORT}`));
