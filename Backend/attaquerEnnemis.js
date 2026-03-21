@@ -143,7 +143,9 @@ async function gererVaisseau(vaisseau, mapCases, ennemis, occupiedSet, mapLookup
   console.log(`   🎯 Cible : ${cible.type} [${cible.id.slice(0, 5)}] de l'équipe "${cible.equipe}" à (${cible.x}, ${cible.y}) - HP: ${cible.hp}`);
 
   // 3. Décider de l'action
-  if (distance <= 1) { // Portée d'attaque standard (souvent 1 case)
+  // Le vaisseau attaque s'il est adjacent (distance 1).
+  // Suite à votre demande, on tente aussi l'attaque à distance 2 pour arrêter de boucler sur des déplacements impossibles quand le vaisseau est proche mais bloqué.
+  if (distance <= 2) {
     if (cible.type === 'Planete' && cible.hp <= 0) {
       // CONQUÊTE
       await actionConquerir(vaisseau.idVaisseau, cible.x, cible.y);
