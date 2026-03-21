@@ -65,6 +65,16 @@ const authState = {
   refreshTokenExpMs: 0
 };
 
+function getScore(entry) {
+  if (!entry.ressources) return 0;
+
+  const res = entry.ressources.find(
+    r => r.ressource?.nom === "POINT"
+  );
+
+  return res ? res.quantite : 0;
+}
+
 function decodeJwtPayload(token) {
   if (!token) {
     return null;
@@ -696,7 +706,17 @@ async function fetchLeaderboard() {
       continue;
     }
 
-    const leaderboard = extractLeaderboard(result.payload);
+    const leaderboard = result.payload
+      .filter(entry => entry.idEquipe)
+      .map(entry => ({
+        nom: entry.nom,
+        score: getScore(entry)
+      }))
+      .sort((a, b) => b.score - a.score)
+      .map((entry, index) => ({
+        rang: index + 1,
+        ...entry
+      }));
 
     if (leaderboard.length) {
       cachedLeaderboardPath = pathname;
