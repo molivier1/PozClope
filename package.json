@@ -10,7 +10,9 @@
     "server:dev": "node --watch server.js",
     "test:harvest-loop": "node scripts/test-harvest-loop.js",
     "game": "node scripts/game.js",
-    "farm": "node scripts/farm.js"
+    "getmodel": "node scripts/getmodel.js",
+    "farm": "node scripts/farm.js",
+    "farm-cargos": "node scripts/farm-cargos.js"
   },
   "dependencies": {
     "dotenv": "^17.3.1",
