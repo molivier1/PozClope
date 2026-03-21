@@ -309,7 +309,8 @@ function normalizeCell(cell) {
     coord_x: x,
     coord_y: y,
     proprietaire: normalizeOwner(cell.proprietaire),
-    planete: normalizePlanet(cell.planete)
+    planete: normalizePlanet(cell.planete ?? cell.planet ?? null),
+    vaisseaux: extractArray(cell.vaisseaux ?? cell.ships).map((v, index) => normalizeShip(v, index)).filter(Boolean)
   };
 }
 
@@ -324,6 +325,7 @@ function normalizeShip(ship, index) {
   return {
     identifiant: ship.identifiant ?? ship.idVaisseau ?? ship.id ?? `ship-${index}`,
     nom: ship.nom ?? ship.name ?? `Vaisseau ${index + 1}`,
+    proprietaire: normalizeOwner(ship.proprietaire),
     typeId: ship.modeleVaisseau?.id ?? ship.type?.id ?? null,
     type: ship.modeleVaisseau?.nom ?? ship.type?.nom ?? ship.type ?? null,
     classeVaisseau:
