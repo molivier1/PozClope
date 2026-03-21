@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="fr">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>24h du code | Star Map</title>
+    <link rel="stylesheet" href="/style.css" />
+    <script src="/script.js" defer></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <section class="panel hero-panel">
+          <p class="eyebrow">24h du code</p>
+          <h1>Strategic Star Map</h1>
+          <p id="statusText" class="muted">Connexion en cours...</p>
+        </section>
+
+        <section class="panel controls-panel">
+          <div class="controls-grid">
+            <button id="refreshButton" class="primary-button" type="button">
+              Rafraichir
+            </button>
+
+            <label class="field">
+              <span>Auto refresh</span>
+              <select id="refreshSelect">
+                <option value="5000">5 s</option>
+                <option value="10000" selected>10 s</option>
+                <option value="20000">20 s</option>
+                <option value="0">Pause</option>
+              </select>
+            </label>
+
+            <label class="toggle">
+              <input id="followShipsToggle" type="checkbox" checked />
+              <span>Zoom intelligent sur les vaisseaux</span>
+            </label>
+
+            <div class="zoom-row">
+              <button id="zoomOutButton" type="button">-</button>
+              <button id="fitButton" type="button">Centrer flotte</button>
+              <button id="zoomInButton" type="button">+</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel metrics-panel">
+          <div class="metric-card">
+            <span class="metric-label">Cases connues</span>
+            <strong id="knownCount">0</strong>
+          </div>
+          <div class="metric-card">
+            <span class="metric-label">Planetes detectees</span>
+            <strong id="planetCount">0</strong>
+          </div>
+          <div class="metric-card">
+            <span class="metric-label">Planetes riches</span>
+            <strong id="richCount">0</strong>
+          </div>
+          <div class="metric-card">
+            <span class="metric-label">Mes vaisseaux</span>
+            <strong id="shipCount">0</strong>
+          </div>
+        </section>
+
+        <section class="panel fleet-panel">
+          <div class="panel-heading">
+            <h2>Flotte</h2>
+            <span id="zoomLabel" class="badge">100%</span>
+          </div>
+          <ul id="fleetList" class="stack-list empty-state">
+            <li>Aucun vaisseau detecte.</li>
+          </ul>
+        </section>
+
+        <section class="panel targets-panel">
+          <div class="panel-heading">
+            <h2>Cibles proches</h2>
+            <span id="rangeLabel" class="badge">-</span>
+          </div>
+          <ul id="targetsList" class="stack-list empty-state">
+            <li>Aucune planete visible.</li>
+          </ul>
+        </section>
+
+        <section class="panel legend-panel">
+          <h2>Legende</h2>
+          <ul class="legend-list">
+            <li><span class="swatch swatch-unknown"></span> Inconnue</li>
+            <li><span class="swatch swatch-known"></span> Case connue</li>
+            <li><span class="swatch swatch-empty"></span> Secteur vide</li>
+            <li><span class="swatch swatch-planet"></span> Planete reperee</li>
+            <li><span class="swatch swatch-neutral"></span> Planete libre</li>
+            <li><span class="swatch swatch-rich"></span> Planete riche</li>
+            <li><span class="swatch swatch-ship"></span> Vaisseau ami</li>
+          </ul>
+          <p id="lastUpdate" class="muted">Derniere mise a jour : jamais</p>
+        </section>
+      </aside>
+
+      <main class="board-panel">
+        <section class="panel map-panel">
+          <div class="map-header">
+            <div>
+              <p class="eyebrow">Vue 58 x 58</p>
+              <h2>Carte tactique</h2>
+            </div>
+            <p class="muted">
+              La grille complete est affichee, avec focus automatique sur la
+              zone utile.
+            </p>
+          </div>
+
+          <div id="mapViewport" class="map-viewport">
+            <div
+              id="mapGrid"
+              class="map-grid"
+              aria-label="Carte strategique spatiale"
+            ></div>
+            <div id="tooltip" class="tooltip" hidden></div>
+          </div>
+        </section>
+      </main>
+    </div>
+  </body>
+</html>
