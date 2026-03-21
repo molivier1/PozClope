@@ -1,77 +1,156 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import './App.css';
 
-const GRID_SIZE = 58;
+const FULL_MAP = 58; 
+const BASE_CELL_SIZE = 50; 
 
 function App() {
-  // MOCK DATA: Replace these with API calls later
-  const [credits] = useState(1500);
-  const [teamScore] = useState(500);
-  const [selectedEntity, setSelectedEntity] = useState(null);
-
-  // Mock positions for your initial 2 ships and base planet [cite: 59]
+  // MOCK DATA [cite: 59, 65, 100]
   const [ships] = useState([
-    { id: 's1', x: 10, y: 10, type: 'scout', hp: 100 },
-    { id: 's2', x: 11, y: 10, type: 'miner', hp: 100 }
+    { id: 'Ome-1', x: 25, y: 25, type: 'amiral_1', hp: 92, cargo: 30, captain: 'K. VANCE' },
+    { id: 'Min-3', x: 26, y: 25, type: 'chasseur_leger_1', hp: 100, cargo: 10, captain: 'J. DOE' }
   ]);
-
   const [planets] = useState([
-    { x: 10, y: 11, name: "Home Planet", type: "base", owner: "me" }
+    { x: 25, y: 26, name: "Neptune Alpha", category: "gazeuse", type: "aquatique", owner: "me", temp: '-190C' }
+  ]);
+  const [leaderboard] = useState([
+    { rank: 1, team: "Nexus Collective", score: 8500 },
+    { rank: 2, team: "Cyber Vanguard", score: 7200 },
+    { rank: 3, team: "Your Team", score: 5400, isYou: true },
+    { rank: 4, team: "Ghost Protocol", score: 4800 }
   ]);
 
-  const handleCellClick = (x, y) => {
-    const ship = ships.find(s => s.x === x && s.y === y);
-    const planet = planets.find(p => p.x === x && p.y === y);
-    setSelectedEntity(ship || planet || { type: 'empty', x, y });
-  };
+  const [zoom, setZoom] = useState(1);
+  const [viewport, setViewport] = useState({ x: 0, y: 0 });
+  const [selected, setSelected] = useState(null);
+  const [credits] = useState(15000);
+  const [score] = useState(5400);
 
-  const renderGrid = () => {
-    let cells = [];
-    for (let y = 0; y < GRID_SIZE; y++) {
-      for (let x = 0; x < GRID_SIZE; x++) {
-        const ship = ships.find(s => s.x === x && s.y === y);
-        const planet = planets.find(p => p.x === x && p.y === y);
+  const hudRef = useRef(null);
+  const [lineCoords, setLineCoords] = useState(null);
 
-        cells.push(
-          <div key={`${x}-${y}`} className="cell" onClick={() => handleCellClick(x, y)}>
-            {planet && <img src={`/assets/planet_${planet.type}.png`} className="asset-img" />}
-            {ship && <img src={`/assets/ship_${ship.type}.png`} className="asset-img" />}
-          </div>
-        );
-      }
+  const handleWheel = useCallback((e) => {
+    e.preventDefault();
+    const delta = e.deltaY > 0 ? -0.1 : 0.1;
+    setZoom(prev => Math.min(Math.max(prev + delta, 0.4), 2));
+  }, []);
+
+  useEffect(() => {
+    window.addEventListener('wheel', handleWheel, { passive: false });
+    return () => window.removeEventListener('wheel', handleWheel);
+  }, [handleWheel]);
+
+  const fleetX = (ships[0].x * BASE_CELL_SIZE) + (BASE_CELL_SIZE / 2);
+  const fleetY = (ships[0].y * BASE_CELL_SIZE) + (BASE_CELL_SIZE / 2);
+
+  useEffect(() => {
+    const centerX = window.innerWidth / 2 - (fleetX * zoom);
+    const centerY = window.innerHeight / 2 - (fleetY * zoom);
+    setViewport({ x: centerX, y: centerY });
+  }, [ships, fleetX, fleetY, zoom]);
+
+  useEffect(() => {
+    if (selected && hudRef.current) {
+      const hudRect = hudRef.current.getBoundingClientRect();
+      const startX = (selected.x * BASE_CELL_SIZE * zoom) + viewport.x + (BASE_CELL_SIZE * zoom / 2);
+      const startY = (selected.y * BASE_CELL_SIZE * zoom) + viewport.y + (BASE_CELL_SIZE * zoom / 2);
+      
+      setLineCoords({
+        x1: startX,
+        y1: startY,
+        x2: hudRect.left,
+        y2: hudRect.top + 30
+      });
+    } else {
+      setLineCoords(null);
     }
-    return cells;
-  };
+  }, [selected, viewport, zoom]);
 
   return (
     <div className="game-container">
-      {/* SIDEBAR: Ranking and Stats  */}
-      <div className="sidebar" style={{ width: '300px', padding: '20px', borderRight: '1px solid #333' }}>
-        <h2>Space Conquerors</h2>
-        <div className="stats-card">
-          <p>Credits: 🪙 {credits}</p>
-          <p>Score: ⭐ {teamScore}</p>
-        </div>
-        <hr />
-        {selectedEntity ? (
-          <div className="inspector">
-            <h3>Inspector</h3>
-            <p>Type: {selectedEntity.type}</p>
-            <p>Coords: {selectedEntity.x}, {selectedEntity.y}</p>
-            {selectedEntity.hp && <p>HP: {selectedEntity.hp}%</p>}
-            {/* Action buttons appear here [cite: 88] */}
-            <button className="action-btn">MOVE</button>
-            <button className="action-btn">RECOLTER</button>
-          </div>
-        ) : <p>Select a ship or planet</p>}
+      <div className="scanline" />
+      
+      <div 
+        className="map-canvas" 
+        style={{ 
+          transform: `translate(${viewport.x}px, ${viewport.y}px) scale(${zoom})`,
+          '--hole-x': `${fleetX}px`,
+          '--hole-y': `${fleetY}px`
+        }}
+      >
+        {[...Array(FULL_MAP * FULL_MAP)].map((_, i) => {
+          const x = i % FULL_MAP;
+          const y = Math.floor(i / FULL_MAP);
+          const ship = ships.find(s => s.x === x && s.y === y);
+          const planet = planets.find(p => p.x === x && p.y === y);
+
+          return (
+            <div key={i} className="cell" onClick={() => setSelected(ship || planet)}>
+              {planet && <img src={`/assets/assets 2d/planets/${planet.category}/${planet.type}.svg`} className="asset-img planet-glow" />}
+              {ship && <img src={`/assets/assets 2d/vaisseaux_2D/${ship.type}.png`} className="asset-img" />}
+            </div>
+          );
+        })}
+        <div className="fow-overlay" />
       </div>
 
-      {/* MAP VIEWPORT  */}
-      <div className="map-viewport">
-        <div className="grid-layer">
-          {renderGrid()}
+      {lineCoords && (
+        <svg className="connector-svg">
+          <path 
+            d={`M ${lineCoords.x1} ${lineCoords.y1} L ${lineCoords.x1 + 30} ${lineCoords.y1 - 30} L ${lineCoords.x2} ${lineCoords.y2}`}
+            className="tech-line"
+          />
+          <circle cx={lineCoords.x1} cy={lineCoords.y1} r="4" fill="var(--accent)" className="core-pulse" />
+        </svg>
+      )}
+
+      {/* TOP LEFT: Vitals  */}
+      <div className="hud-panel glass-tech hud-top-left">
+        <div className="glitch-text label-tiny">// CORE_LINK_STABLE</div>
+        <div className="data-row"><span>CREDITS</span><span className="value-neon">🪙 {credits}</span></div>
+        <div className="data-row"><span>RANKING_PTS</span><span className="value-neon">⭐ {score}</span></div>
+      </div>
+
+      {/* RIGHT SIDE: Leaderboard & Fleet  */}
+      <div className="hud-panel glass-tech hud-right-side">
+        <div className="glitch-text label-tiny">// SECTOR_RANKINGS</div>
+        <div className="leaderboard-mini">
+          {leaderboard.map(t => (
+            <div key={t.rank} className={`lb-row ${t.isYou ? 'you' : ''}`}>
+              <span>{t.rank}. {t.team}</span>
+              <span className="val">{t.score}</span>
+            </div>
+          ))}
+        </div>
+
+        <div className="glitch-text label-tiny" style={{marginTop: '20px'}}>// ACTIVE_UNITS</div>
+        <div className="fleet-mini">
+          {ships.map(s => (
+            <div key={s.id} className="fleet-row">
+              <div className="flex-row"><span>{s.id}</span><span>{s.hp}%</span></div>
+              <div className="prog-bar-mini"><div className="fill" style={{width: `${s.hp}%`}} /></div>
+            </div>
+          ))}
         </div>
       </div>
+
+      {/* DYNAMIC CALLOUT HUD [cite: 24, 25, 26, 27] */}
+      {selected && (
+        <div className="hud-panel glass-tech hud-callout" ref={hudRef}>
+          <div className="glitch-text label-tiny" style={{color: '#ffc857'}}>// TARGET_DATA_RESTRICTION_C2</div>
+          <h2 className="panel-h2">{selected.name || selected.type.toUpperCase()}</h2>
+          <div className="inspector-grid">
+            <div className="ins-item"><span className="label">COORDINATES</span><span className="val">[{selected.x}, {selected.y}]</span></div>
+            {selected.hp && <div className="ins-item"><span className="label">STRUCTURAL</span><span className="val">{selected.hp}%</span></div>}
+            {selected.cargo !== undefined && <div className="ins-item"><span className="label">CARGO_VAL</span><span className="val">{selected.cargo}%</span></div>}
+          </div>
+          <div className="action-row-tech">
+            <button className="cyber-btn-sml">NAVIGATE</button>
+            <button className="cyber-btn-sml">EXTRACT</button>
+            <button className="cyber-btn-sml">ENGAGE</button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
