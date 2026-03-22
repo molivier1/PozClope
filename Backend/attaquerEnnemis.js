@@ -11,8 +11,19 @@ dotenv.config({ path: path.join(__dirname, ".env") });
 dotenv.config({ path: path.join(__dirname, "..", ".env"), override: false });
 
 const API_URL = process.env.API_URL;
-const TOKEN = process.env.TOKEN?.trim();
 const TEAM_ID = process.env.TEAM_ID;
+const AUTH_BASE_URL = process.env.KEYCLOAK_URL ?? process.env.AUTH_URL ?? null;
+const AUTH_REALM = process.env.KEYCLOAK_REALM ?? "24hcode";
+const AUTH_CLIENT_ID = process.env.KEYCLOAK_CLIENT_ID ?? "vaissals-backend";
+const AUTH_CLIENT_SECRET = process.env.KEYCLOAK_CLIENT_SECRET ?? null;
+const AUTH_USERNAME = process.env.KEYCLOAK_USERNAME ?? null;
+const AUTH_PASSWORD = process.env.KEYCLOAK_PASSWORD ?? null;
+
+const authState = {
+  accessToken: process.env.TOKEN?.trim() ?? null,
+  accessTokenExpMs: 0,
+  refreshToken: null
+};
 
 const LOOP_DELAY_MS = parseNumber(process.env.ATTACK_LOOP_MS, 2000);
 const FOCUS_RADIUS = parseNumber(process.env.ATTACK_FOCUS_RADIUS, 8);
@@ -89,13 +100,102 @@ function requireConfig() {
     throw new Error("API_URL manquant dans .env");
   }
 
-  if (!TOKEN) {
-    throw new Error("TOKEN manquant dans .env");
-  }
-
   if (!TEAM_ID) {
     throw new Error("TEAM_ID manquant dans .env");
   }
+}
+
+function decodeJwtPayload(token) {
+  if (!token) {
+    return null;
+  }
+
+  try {
+    const parts = token.split(".");
+    if (parts.length < 2) {
+      return null;
+    }
+
+    return JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function getTokenExpiryMs(token) {
+  const payload = decodeJwtPayload(token);
+  return Number.isFinite(payload?.exp) ? payload.exp * 1000 : 0;
+}
+
+function isTokenUsable(expiresAtMs) {
+  return Number.isFinite(expiresAtMs) && expiresAtMs - Date.now() > 60000;
+}
+
+async function requestToken(formData) {
+  if (!AUTH_BASE_URL) {
+    throw new Error("AUTH_URL manquant dans .env");
+  }
+
+  const tokenUrl = `${AUTH_BASE_URL}/realms/${AUTH_REALM}/protocol/openid-connect/token`;
+  const payload = new URLSearchParams({
+    client_id: AUTH_CLIENT_ID,
+    ...formData
+  });
+
+  if (AUTH_CLIENT_SECRET) {
+    payload.set("client_secret", AUTH_CLIENT_SECRET);
+  }
+
+  const response = await fetch(tokenUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: payload
+  });
+
+  if (!response.ok) {
+    throw new Error(`Erreur Auth ${response.status}: ${await response.text()}`);
+  }
+
+  const json = await response.json();
+  authState.accessToken = json.access_token;
+  authState.accessTokenExpMs = getTokenExpiryMs(json.access_token);
+
+  if (json.refresh_token) {
+    authState.refreshToken = json.refresh_token;
+  }
+
+  return authState.accessToken;
+}
+
+async function ensureAccessToken(forceRefresh = false) {
+  if (!forceRefresh && isTokenUsable(authState.accessTokenExpMs)) {
+    return authState.accessToken;
+  }
+
+  if (authState.refreshToken) {
+    try {
+      return await requestToken({
+        grant_type: "refresh_token",
+        refresh_token: authState.refreshToken
+      });
+    } catch {
+      authState.refreshToken = null;
+    }
+  }
+
+  if (AUTH_USERNAME && AUTH_PASSWORD) {
+    return requestToken({
+      grant_type: "password",
+      username: AUTH_USERNAME,
+      password: AUTH_PASSWORD
+    });
+  }
+
+  if (authState.accessToken) {
+    return authState.accessToken;
+  }
+
+  throw new Error("Impossible d'obtenir un token valide.");
 }
 
 function getDistance(x1, y1, x2, y2) {
@@ -207,15 +307,29 @@ function isFailedMove(shipId, x, y) {
 }
 
 async function apiPost(pathname, body) {
-  const response = await fetch(`${API_URL}${pathname}`, {
+  let token = await ensureAccessToken();
+  let response = await fetch(`${API_URL}${pathname}`, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${TOKEN}`,
+      Authorization: `Bearer ${token}`,
       Accept: "application/json",
       "Content-Type": "application/json"
     },
     body: JSON.stringify(body)
   });
+
+  if (response.status === 401) {
+    token = await ensureAccessToken(true);
+    response = await fetch(`${API_URL}${pathname}`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: "application/json",
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(body)
+    });
+  }
 
   const rawText = await response.text();
   const data = tryParseJson(rawText);
@@ -232,12 +346,23 @@ async function apiPost(pathname, body) {
 }
 
 async function apiGet(pathname) {
-  const response = await fetch(`${API_URL}${pathname}`, {
+  let token = await ensureAccessToken();
+  let response = await fetch(`${API_URL}${pathname}`, {
     headers: {
-      Authorization: `Bearer ${TOKEN}`,
+      Authorization: `Bearer ${token}`,
       Accept: "application/json"
     }
   });
+
+  if (response.status === 401) {
+    token = await ensureAccessToken(true);
+    response = await fetch(`${API_URL}${pathname}`, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: "application/json"
+      }
+    });
+  }
 
   const rawText = await response.text();
   const data = tryParseJson(rawText);
@@ -264,6 +389,8 @@ function tryParseJson(value) {
     return null;
   }
 }
+
+authState.accessTokenExpMs = getTokenExpiryMs(authState.accessToken);
 
 async function sendShipAction(shipId, action, x, y) {
   return apiPost(`/equipes/${TEAM_ID}/vaisseaux/${shipId}/demander-action`, {
@@ -514,10 +641,6 @@ function isPassableMove(cell, target = null) {
   const terrainType = cell.type?.nom ?? cell.type ?? null;
 
   if (terrainType === "ASTEROIDE" || terrainType === "Astéroïde") {
-    return false;
-  }
-
-  if (cell.planete) {
     return false;
   }
 

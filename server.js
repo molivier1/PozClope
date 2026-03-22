@@ -1,5 +1,6 @@
 const fs = require("node:fs");
 const path = require("node:path");
+const { pathToFileURL } = require("node:url");
 const express = require("express");
 const dotenv = require("dotenv");
 
@@ -25,6 +26,14 @@ const LEADERBOARD_CANDIDATE_PATHS = [
   "/scores",
   "/equipes"
 ];
+const SHIP_ACTIONS = new Set([
+  "DEPLACEMENT",
+  "RECOLTER",
+  "DEPOSER",
+  "CONQUERIR",
+  "ATTAQUER",
+  "REPARER"
+]);
 
 for (const envPath of ENV_PATHS) {
   if (fs.existsSync(envPath)) {
@@ -68,27 +77,43 @@ const authState = {
 };
 
 let cachedFullMap = [];
+let cachedFullMapFetchedAt = 0;
 let isFetchingMap = false;
+let cachedEnemyShips = [];
+let cachedEnemyShipsFetchedAt = 0;
+
+async function fetchFullMapChunks() {
+  const chunkSize = 18;
+  const fullMap = [];
+
+  for (let y = 0; y < MAP_SIZE; y += chunkSize) {
+    for (let x = 0; x < MAP_SIZE; x += chunkSize) {
+      const xEnd = Math.min(x + chunkSize - 1, MAP_SIZE - 1);
+      const yEnd = Math.min(y + chunkSize - 1, MAP_SIZE - 1);
+      const response = await authorizedFetch(
+        `/monde/map?x_range=${x},${xEnd}&y_range=${y},${yEnd}`
+      );
+
+      if (!response.ok) {
+        continue;
+      }
+
+      const payload = await response.json();
+      fullMap.push(...extractArray(payload));
+    }
+  }
+
+  return fullMap.map(normalizeCell).filter(Boolean);
+}
 
 async function refreshFullMap() {
   if (isFetchingMap || !API_URL) return;
   isFetchingMap = true;
   try {
-    const chunkSize = 18;
-    const fullMap = [];
-    for (let y = 0; y < MAP_SIZE; y += chunkSize) {
-      for (let x = 0; x < MAP_SIZE; x += chunkSize) {
-        const xEnd = Math.min(x + chunkSize - 1, MAP_SIZE - 1);
-        const yEnd = Math.min(y + chunkSize - 1, MAP_SIZE - 1);
-        const response = await authorizedFetch(`/monde/map?x_range=${x},${xEnd}&y_range=${y},${yEnd}`);
-        if (response.ok) {
-          const payload = await response.json();
-          fullMap.push(...extractArray(payload));
-        }
-      }
-    }
+    const fullMap = await fetchFullMapChunks();
     if (fullMap.length > 0) {
-      cachedFullMap = fullMap.map(normalizeCell).filter(Boolean);
+      cachedFullMap = fullMap;
+      cachedFullMapFetchedAt = Date.now();
     }
   } catch (err) {
     console.error("Map chunk refresh failed:", err.message);
@@ -249,6 +274,339 @@ function parseRange(rawValue, fallback) {
   return clampRange(parts);
 }
 
+function getCellKey(x, y) {
+  return `${Number(x)},${Number(y)}`;
+}
+
+function chebyshevDistance(left, right) {
+  return Math.max(
+    Math.abs(Number(left.x) - Number(right.x)),
+    Math.abs(Number(left.y) - Number(right.y))
+  );
+}
+
+function isPassableCell(cell) {
+  if (!cell) {
+    return false;
+  }
+
+  if (!cell.planete) {
+    return true;
+  }
+
+  return cell.planete.estVide === true;
+}
+
+function buildOccupiedCells(ships, ignoredShipId = null) {
+  const occupied = new Set();
+
+  for (const ship of ships) {
+    if (ignoredShipId && String(ship.identifiant) === String(ignoredShipId)) {
+      continue;
+    }
+
+    occupied.add(getCellKey(ship.coord_x, ship.coord_y));
+  }
+
+  return occupied;
+}
+
+async function getMapCellsInRange(xRange, yRange) {
+  const isLargeRequest =
+    xRange[1] - xRange[0] > 20 || yRange[1] - yRange[0] > 20;
+
+  if (isLargeRequest && cachedFullMap.length > 0) {
+    return cachedFullMap.filter(
+      (cell) =>
+        cell.coord_x >= xRange[0] &&
+        cell.coord_x <= xRange[1] &&
+        cell.coord_y >= yRange[0] &&
+        cell.coord_y <= yRange[1]
+    );
+  }
+
+  const payload = await apiGet(
+    `/monde/map?x_range=${xRange.join(",")}&y_range=${yRange.join(",")}`
+  );
+
+  return extractArray(payload).map(normalizeCell).filter(Boolean);
+}
+
+async function resolveMoveActionTarget(ship, finalTarget, occupiedCells) {
+  const speed = Math.max(1, Number(ship.vitesse ?? 0));
+  const target = {
+    x: clamp(Number(finalTarget.x), 0, MAP_SIZE - 1),
+    y: clamp(Number(finalTarget.y), 0, MAP_SIZE - 1)
+  };
+  const current = {
+    x: Number(ship.coord_x),
+    y: Number(ship.coord_y)
+  };
+
+  if (current.x === target.x && current.y === target.y) {
+    return {
+      coord_x: target.x,
+      coord_y: target.y,
+      issuedIntermediateTarget: false
+    };
+  }
+
+  const xRange = clampRange([current.x - speed, current.x + speed]);
+  const yRange = clampRange([current.y - speed, current.y + speed]);
+  const cells = await getMapCellsInRange(xRange, yRange);
+  const cellsByCoord = new Map(
+    cells.map((cell) => [getCellKey(cell.coord_x, cell.coord_y), cell])
+  );
+
+  const candidates = [];
+
+  for (let x = xRange[0]; x <= xRange[1]; x += 1) {
+    for (let y = yRange[0]; y <= yRange[1]; y += 1) {
+      if (x === current.x && y === current.y) {
+        continue;
+      }
+
+      const moveDistance = chebyshevDistance(current, { x, y });
+
+      if (moveDistance > speed) {
+        continue;
+      }
+
+      if (occupiedCells.has(getCellKey(x, y))) {
+        continue;
+      }
+
+      const cell = cellsByCoord.get(getCellKey(x, y));
+
+      if (!isPassableCell(cell)) {
+        continue;
+      }
+
+      candidates.push({
+        x,
+        y,
+        moveDistance,
+        remainingDistance: chebyshevDistance({ x, y }, target)
+      });
+    }
+  }
+
+  if (candidates.length === 0) {
+    throw createHttpError(
+      `${ship.nom}: aucune case de deplacement valide vers [${target.x}:${target.y}].`,
+      409
+    );
+  }
+
+  candidates.sort((left, right) => {
+    if (left.remainingDistance !== right.remainingDistance) {
+      return left.remainingDistance - right.remainingDistance;
+    }
+
+    if (left.moveDistance !== right.moveDistance) {
+      return right.moveDistance - left.moveDistance;
+    }
+
+    return left.x - right.x || left.y - right.y;
+  });
+
+  const nextTarget = candidates[0];
+
+  return {
+    coord_x: nextTarget.x,
+    coord_y: nextTarget.y,
+    issuedIntermediateTarget:
+      nextTarget.x !== target.x || nextTarget.y !== target.y
+  };
+}
+
+function buildAdjacentCells(target) {
+  const cells = [];
+
+  for (let dx = -1; dx <= 1; dx += 1) {
+    for (let dy = -1; dy <= 1; dy += 1) {
+      if (dx === 0 && dy === 0) {
+        continue;
+      }
+
+      const x = clamp(Number(target.x) + dx, 0, MAP_SIZE - 1);
+      const y = clamp(Number(target.y) + dy, 0, MAP_SIZE - 1);
+      cells.push({ x, y });
+    }
+  }
+
+  return cells.filter(
+    (cell, index, array) =>
+      array.findIndex((entry) => entry.x === cell.x && entry.y === cell.y) === index
+  );
+}
+
+function chooseNextStepToward(ship, target, occupiedCells, cellsByCoord) {
+  const speed = Math.max(1, Number(ship.vitesse ?? 0));
+  const current = {
+    x: Number(ship.coord_x),
+    y: Number(ship.coord_y)
+  };
+  const candidates = [];
+
+  for (let x = current.x - speed; x <= current.x + speed; x += 1) {
+    for (let y = current.y - speed; y <= current.y + speed; y += 1) {
+      if (x < 0 || x >= MAP_SIZE || y < 0 || y >= MAP_SIZE) {
+        continue;
+      }
+
+      if (x === current.x && y === current.y) {
+        continue;
+      }
+
+      if (chebyshevDistance(current, { x, y }) > speed) {
+        continue;
+      }
+
+      if (occupiedCells.has(getCellKey(x, y))) {
+        continue;
+      }
+
+      const cell = cellsByCoord.get(getCellKey(x, y));
+
+      if (!isPassableCell(cell)) {
+        continue;
+      }
+
+      candidates.push({
+        x,
+        y,
+        remainingDistance: chebyshevDistance({ x, y }, target),
+        moveDistance: chebyshevDistance(current, { x, y })
+      });
+    }
+  }
+
+  if (!candidates.length) {
+    return null;
+  }
+
+  candidates.sort((left, right) => {
+    if (left.remainingDistance !== right.remainingDistance) {
+      return left.remainingDistance - right.remainingDistance;
+    }
+
+    if (left.moveDistance !== right.moveDistance) {
+      return right.moveDistance - left.moveDistance;
+    }
+
+    return left.x - right.x || left.y - right.y;
+  });
+
+  return candidates[0];
+}
+
+function pickAdjacentStage(ship, target, occupiedCells, cellsByCoord) {
+  const current = {
+    x: Number(ship.coord_x),
+    y: Number(ship.coord_y)
+  };
+  const candidates = buildAdjacentCells(target).filter((cell) => {
+    if (occupiedCells.has(getCellKey(cell.x, cell.y))) {
+      return false;
+    }
+
+    return isPassableCell(cellsByCoord.get(getCellKey(cell.x, cell.y)));
+  });
+
+  if (!candidates.length) {
+    return null;
+  }
+
+  candidates.sort((left, right) => {
+    const leftDistance = chebyshevDistance(current, left);
+    const rightDistance = chebyshevDistance(current, right);
+    return leftDistance - rightDistance || left.x - right.x || left.y - right.y;
+  });
+
+  return candidates[0];
+}
+
+async function resolveSmartShipAction(ship, requestedAction, targetCoord, occupiedCells) {
+  const current = {
+    x: Number(ship.coord_x),
+    y: Number(ship.coord_y)
+  };
+  const target = {
+    x: clamp(Number(targetCoord.x), 0, MAP_SIZE - 1),
+    y: clamp(Number(targetCoord.y), 0, MAP_SIZE - 1)
+  };
+
+  if (requestedAction === "DEPLACEMENT") {
+    const resolvedTarget = await resolveMoveActionTarget(ship, target, occupiedCells);
+    return {
+      issuedAction: "DEPLACEMENT",
+      coord_x: resolvedTarget.coord_x,
+      coord_y: resolvedTarget.coord_y,
+      completed:
+        !resolvedTarget.issuedIntermediateTarget &&
+        resolvedTarget.coord_x === target.x &&
+        resolvedTarget.coord_y === target.y
+    };
+  }
+
+  const xRange = clampRange([Math.min(current.x, target.x) - 1, Math.max(current.x, target.x) + 1]);
+  const yRange = clampRange([Math.min(current.y, target.y) - 1, Math.max(current.y, target.y) + 1]);
+  const cells = await getMapCellsInRange(xRange, yRange);
+  const cellsByCoord = new Map(
+    cells.map((cell) => [getCellKey(cell.coord_x, cell.coord_y), cell])
+  );
+  const inRange = chebyshevDistance(current, target) === 1;
+
+  if (inRange) {
+    if (requestedAction === "CONQUERIR") {
+      const targetCell = cellsByCoord.get(getCellKey(target.x, target.y));
+      const targetHp = Number(targetCell?.planete?.pointDeVie ?? 0);
+
+      if (targetHp > 0) {
+        return {
+          issuedAction: "ATTAQUER",
+          coord_x: target.x,
+          coord_y: target.y,
+          completed: false
+        };
+      }
+    }
+
+    return {
+      issuedAction: requestedAction,
+      coord_x: target.x,
+      coord_y: target.y,
+      completed: true
+    };
+  }
+
+  const stage = pickAdjacentStage(ship, target, occupiedCells, cellsByCoord);
+
+  if (!stage) {
+    throw createHttpError(
+      `${ship.nom}: aucune case libre pour approcher [${target.x}:${target.y}].`,
+      409
+    );
+  }
+
+  const moveTarget = chooseNextStepToward(ship, stage, occupiedCells, cellsByCoord);
+
+  if (!moveTarget) {
+    throw createHttpError(
+      `${ship.nom}: aucun chemin libre vers [${target.x}:${target.y}].`,
+      409
+    );
+  }
+
+  return {
+    issuedAction: "DEPLACEMENT",
+    coord_x: moveTarget.x,
+    coord_y: moveTarget.y,
+    completed: false
+  };
+}
+
 function pickCoord(entity, axis) {
   const coordKey = `coord_${axis}`;
   const camelKey = `coord${axis.toUpperCase()}`;
@@ -267,9 +625,16 @@ function normalizeOwner(owner) {
     return null;
   }
 
+  if (typeof owner === "string" || typeof owner === "number") {
+    return {
+      identifiant: String(owner),
+      nom: null
+    };
+  }
+
   return {
-    identifiant: owner.identifiant ?? owner.id ?? null,
-    nom: owner.nom ?? owner.name ?? null
+    identifiant: owner.identifiant ?? owner.id ?? owner.idEquipe ?? null,
+    nom: owner.nom ?? owner.name ?? owner.nomEquipe ?? null
   };
 }
 
@@ -310,13 +675,18 @@ function normalizeCell(cell) {
     coord_y: y,
     proprietaire: normalizeOwner(cell.proprietaire),
     planete: normalizePlanet(cell.planete ?? cell.planet ?? null),
-    vaisseaux: extractArray(cell.vaisseaux ?? cell.ships).map((v, index) => normalizeShip(v, index)).filter(Boolean)
+    vaisseaux: [
+      ...extractArray(cell.vaisseaux ?? cell.ships),
+      ...(cell.vaisseau ? [cell.vaisseau] : [])
+    ]
+      .map((v, index) => normalizeShip(v, index, { x, y }))
+      .filter(Boolean)
   };
 }
 
-function normalizeShip(ship, index) {
-  const x = pickCoord(ship, "x");
-  const y = pickCoord(ship, "y");
+function normalizeShip(ship, index, fallbackCoords = {}) {
+  const x = pickCoord(ship, "x") ?? fallbackCoords.x ?? null;
+  const y = pickCoord(ship, "y") ?? fallbackCoords.y ?? null;
 
   if (x === null || y === null) {
     return null;
@@ -463,6 +833,124 @@ function filterActiveShips(ships, teamPayload) {
   return ships.filter((ship) => activeNames.has(normalizeShipName(ship.nom)));
 }
 
+function getOwnerKey(owner) {
+  if (!owner) {
+    return null;
+  }
+
+  return String(owner.identifiant ?? owner.id ?? owner.nom ?? owner.name ?? "").trim() || null;
+}
+
+async function getKnownEnemyShips() {
+  if (cachedEnemyShips.length && Date.now() - cachedEnemyShipsFetchedAt < 12_000) {
+    return cachedEnemyShips;
+  }
+
+  const teamsPayload = await apiGet("/equipes");
+  const teams = extractArray(teamsPayload)
+    .map((team) => normalizeTeam(team))
+    .filter((team) => team.identifiant || team.nom);
+  const enemyTeams = teams.filter(
+    (team) => String(team.identifiant ?? "") !== String(TEAM_ID)
+  );
+  const shipsById = new Map();
+
+  const settledShips = await Promise.allSettled(
+    enemyTeams.map(async (team) => {
+      if (!team.identifiant) {
+        return [];
+      }
+
+      const payload = await apiGet(`/equipes/${team.identifiant}/vaisseaux`);
+      return extractArray(payload)
+        .map((ship, index) => normalizeShip(ship, index))
+        .filter(Boolean)
+        .map((ship) => ({
+          identifiant: ship.identifiant,
+          nom: ship.nom,
+          proprietaire: {
+            identifiant: team.identifiant,
+            nom: team.nom ?? "Inconnu"
+          },
+          type: ship.type,
+          classeVaisseau: ship.classeVaisseau,
+          coord_x: ship.coord_x,
+          coord_y: ship.coord_y,
+          pointDeVie: ship.pointDeVie,
+          vitesse: ship.vitesse,
+          mineraiTransporte: ship.mineraiTransporte,
+          capaciteTransport: ship.capaciteTransport,
+          attaque: ship.attaque,
+          coutConstruction: ship.coutConstruction,
+          dateProchaineAction: ship.dateProchaineAction ?? null
+        }));
+    })
+  );
+
+  for (const result of settledShips) {
+    if (result.status !== "fulfilled") {
+      continue;
+    }
+
+    for (const ship of result.value) {
+      shipsById.set(String(ship.identifiant), ship);
+    }
+  }
+
+  if (!shipsById.size) {
+    if (!cachedFullMap.length) {
+      cachedFullMap = await fetchFullMapChunks();
+      cachedFullMapFetchedAt = Date.now();
+    } else if (Date.now() - cachedFullMapFetchedAt > 20_000) {
+      refreshFullMap().catch(() => {});
+    }
+
+    const teamLookup = new Map(
+      teams
+        .filter((team) => team.identifiant || team.nom)
+        .map((team) => [String(team.identifiant ?? team.nom), team.nom])
+    );
+
+    for (const cell of cachedFullMap) {
+      for (const ship of extractArray(cell.vaisseaux)) {
+        const ownerKey = getOwnerKey(ship.proprietaire);
+        const ownerName =
+          ship.proprietaire?.nom ??
+          (ownerKey ? teamLookup.get(ownerKey) : null) ??
+          "Inconnu";
+
+        if (ownerKey === String(TEAM_ID) || ownerName === null) {
+          continue;
+        }
+
+        shipsById.set(String(ship.identifiant), {
+          identifiant: ship.identifiant,
+          nom: ship.nom,
+          proprietaire: {
+            identifiant: ownerKey,
+            nom: ownerName
+          },
+          type: ship.type,
+          classeVaisseau: ship.classeVaisseau,
+          coord_x: ship.coord_x ?? cell.coord_x,
+          coord_y: ship.coord_y ?? cell.coord_y,
+          pointDeVie: ship.pointDeVie,
+          vitesse: ship.vitesse,
+          mineraiTransporte: ship.mineraiTransporte,
+          capaciteTransport: ship.capaciteTransport,
+          attaque: ship.attaque,
+          coutConstruction: ship.coutConstruction,
+          dateProchaineAction: ship.dateProchaineAction ?? null
+        });
+      }
+    }
+  }
+
+  cachedEnemyShips = Array.from(shipsById.values());
+  cachedEnemyShipsFetchedAt = Date.now();
+  return cachedEnemyShips;
+}
+
 function isTokenUsable(expiresAtMs, skewMs = TOKEN_REFRESH_SKEW_MS) {
   return Number.isFinite(expiresAtMs) && expiresAtMs - Date.now() > skewMs;
 }
@@ -557,6 +1045,18 @@ async function performFetch(url, options, contextLabel) {
       `${contextLabel}: ${describeFetchError(error)}`,
       502
     );
+  }
+}
+
+function parseJson(rawValue) {
+  if (!rawValue) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(rawValue);
+  } catch (error) {
+    return null;
   }
 }
 
@@ -687,16 +1187,23 @@ async function ensureAccessToken(options = {}) {
 }
 
 async function authorizedFetch(pathname, options = {}) {
-  const { retryUnauthorized = true } = options;
+  const {
+    retryUnauthorized = true,
+    headers: customHeaders = {},
+    ...requestOptions
+  } = options;
+  const buildRequestOptions = (token) => ({
+    ...requestOptions,
+    headers: {
+      Accept: "application/json",
+      ...customHeaders,
+      Authorization: `Bearer ${token}`
+    }
+  });
   const accessToken = await ensureAccessToken();
   let response = await performFetch(
     `${API_URL}${pathname}`,
-    {
-      headers: {
-        Accept: "application/json",
-        Authorization: `Bearer ${accessToken}`
-      }
-    },
+    buildRequestOptions(accessToken),
     `Impossible de joindre l'API du jeu sur ${pathname}`
   );
 
@@ -709,12 +1216,7 @@ async function authorizedFetch(pathname, options = {}) {
 
     response = await performFetch(
       `${API_URL}${pathname}`,
-      {
-        headers: {
-          Accept: "application/json",
-          Authorization: `Bearer ${refreshedToken}`
-        }
-      },
+      buildRequestOptions(refreshedToken),
       `Impossible de joindre l'API du jeu sur ${pathname}`
     );
   }
@@ -1173,16 +1675,27 @@ function computeRangeFromShips(ships) {
 }
 
 async function apiGet(pathname) {
-  const response = await authorizedFetch(pathname);
+  return apiRequest(pathname);
+}
+
+async function apiRequest(pathname, options = {}) {
+  const response = await authorizedFetch(pathname, options);
+  const rawText = await response.text();
+  const data = parseJson(rawText);
 
   if (!response.ok) {
-    const message = await response.text();
+    const message =
+      data?.message ||
+      data?.error ||
+      rawText ||
+      `API ${response.status} sur ${pathname}`;
     const error = new Error(`API ${response.status} sur ${pathname}: ${message}`);
     error.status = response.status;
+    error.details = data ?? rawText;
     throw error;
   }
 
-  return response.json();
+  return data ?? rawText ?? null;
 }
 
 async function apiProbe(pathname) {
@@ -1282,6 +1795,7 @@ function ensureConfig(req, res, next) {
 }
 
 app.use(express.static(PUBLIC_DIR));
+app.use(express.json({ limit: "1mb" }));
 
 app.get("/api/health", async (req, res) => {
   const missing = missingConfig();
@@ -1360,6 +1874,44 @@ app.get("/api/ships", ensureConfig, async (req, res, next) => {
   }
 });
 
+app.get("/api/vaisseaux/all", ensureConfig, async (req, res, next) => {
+  try {
+    const teamPayload = await apiGet(`/equipes/${TEAM_ID}`);
+    const teamName = normalizeTeam(teamPayload)?.nom ?? null;
+    const moduleUrl = pathToFileURL(path.join(ROOT_DIR, "Backend", "getAllVaisseaux.js")).href;
+    const { getAllVaisseaux } = await import(moduleUrl);
+    const rawShips = await getAllVaisseaux();
+    const ships = extractArray(rawShips)
+      .filter((ship) => ship?.equipe && ship.equipe !== teamName)
+      .map((ship, index) => ({
+        identifiant: ship.idVaisseau ?? ship.identifiant ?? ship.id ?? `enemy-${index}`,
+        nom: ship.nom ?? `Vaisseau ennemi ${index + 1}`,
+        proprietaire: {
+          identifiant: ship.idEquipe ?? ship.proprietaire ?? ship.equipe ?? null,
+          nom: ship.equipe ?? ship.nomEquipe ?? "Inconnu"
+        },
+        type: ship.type ?? null,
+        classeVaisseau: ship.classe ?? ship.classeVaisseau ?? null,
+        coord_x: Number(ship.coord_x ?? ship.x ?? 0),
+        coord_y: Number(ship.coord_y ?? ship.y ?? 0),
+        pointDeVie: Number(ship.pointDeVie ?? 0),
+        vitesse: Number(ship.vitesse ?? 0),
+        mineraiTransporte: Number(ship.mineraiTransporte ?? 0),
+        capaciteTransport: Number(ship.capaciteTransport ?? 0),
+        attaque: Number(ship.attaque ?? 0),
+        coutConstruction: Number(ship.coutConstruction ?? 0),
+        dateProchaineAction: ship.dateProchaineAction ?? null
+      }));
+
+    res.json({
+      fetchedAt: new Date().toISOString(),
+      ships
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.get("/api/map", ensureConfig, async (req, res, next) => {
   try {
     const xRange = parseRange(req.query.x_range, DEFAULT_RANGE.x);
@@ -1400,16 +1952,32 @@ app.get("/api/state", ensureConfig, async (req, res, next) => {
     const suggestedRange = computeRangeFromShips(ships);
     const xRange = parseRange(req.query.x_range, suggestedRange.x);
     const yRange = parseRange(req.query.y_range, suggestedRange.y);
-    const mapPayload = await apiGet(
-      `/monde/map?x_range=${xRange.join(",")}&y_range=${yRange.join(",")}`
-    );
-    const cells = extractArray(mapPayload)
-      .map(normalizeCell)
-      .filter(Boolean);
-    const economyPlan = buildEconomyPlan(team, ships, cells, {
-      x: xRange,
-      y: yRange
-    });
+    const includePlan = String(req.query.include_plan ?? "1") !== "0";
+    const isLargeRequest = (xRange[1] - xRange[0] > 20) || (yRange[1] - yRange[0] > 20);
+    let cells = [];
+
+    if (isLargeRequest && cachedFullMap.length > 0) {
+      cells = cachedFullMap.filter(
+        (cell) =>
+          cell.coord_x >= xRange[0] &&
+          cell.coord_x <= xRange[1] &&
+          cell.coord_y >= yRange[0] &&
+          cell.coord_y <= yRange[1]
+      );
+    } else {
+      const mapPayload = await apiGet(
+        `/monde/map?x_range=${xRange.join(",")}&y_range=${yRange.join(",")}`
+      );
+      cells = extractArray(mapPayload)
+        .map(normalizeCell)
+        .filter(Boolean);
+    }
+    const economyPlan = includePlan
+      ? buildEconomyPlan(team, ships, cells, {
+          x: xRange,
+          y: yRange
+        })
+      : null;
 
     res.json({
       fetchedAt: new Date().toISOString(),
@@ -1419,7 +1987,7 @@ app.get("/api/state", ensureConfig, async (req, res, next) => {
       range: { x: xRange, y: yRange },
       ships,
       cells,
-      economyPlan
+      ...(includePlan ? { economyPlan } : {})
     });
   } catch (error) {
     next(error);
@@ -1466,6 +2034,144 @@ app.get("/api/leaderboard", ensureConfig, async (req, res, next) => {
       fetchedAt: new Date().toISOString(),
       sourcePath: result.sourcePath,
       leaderboard: result.leaderboard
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/actions/ships", ensureConfig, async (req, res, next) => {
+  try {
+    const shipIds = [
+      ...(Array.isArray(req.body?.shipIds) ? req.body.shipIds : []),
+      ...(req.body?.shipId ? [req.body.shipId] : [])
+    ]
+      .map((value) => String(value ?? "").trim())
+      .filter(Boolean);
+    const action = String(req.body?.action ?? "").toUpperCase();
+    const coordX = Number(req.body?.coord_x);
+    const coordY = Number(req.body?.coord_y);
+
+    if (!shipIds.length) {
+      throw createHttpError("Aucun vaisseau selectionne.", 400);
+    }
+
+    if (!SHIP_ACTIONS.has(action)) {
+      throw createHttpError(`Action invalide: ${action || "?"}.`, 400);
+    }
+
+    if (!Number.isFinite(coordX) || !Number.isFinite(coordY)) {
+      throw createHttpError("Coordonnees invalides pour l'action demandee.", 400);
+    }
+
+    const teamPayload = await apiGet(`/equipes/${TEAM_ID}`);
+    const shipsPayload = await apiGet(`/equipes/${TEAM_ID}/vaisseaux`);
+    const ships = filterActiveShips(
+      extractArray(shipsPayload)
+        .map(normalizeShip)
+        .filter(Boolean),
+      teamPayload
+    );
+    const shipsById = new Map(
+      ships.map((ship) => [String(ship.identifiant), ship])
+    );
+    const uniqueShipIds = [...new Set(shipIds)];
+    const results = [];
+    const occupiedCells = buildOccupiedCells(ships);
+
+    for (const shipId of uniqueShipIds) {
+      const ship = shipsById.get(shipId);
+
+      if (!ship) {
+        results.push({
+          shipId,
+          shipName: shipId,
+          ok: false,
+          status: 404,
+          error: "Vaisseau introuvable dans la flotte active."
+        });
+        continue;
+      }
+
+      try {
+        occupiedCells.delete(getCellKey(ship.coord_x, ship.coord_y));
+
+        const resolvedAction = await resolveSmartShipAction(
+          ship,
+          action,
+          { x: coordX, y: coordY },
+          occupiedCells
+        );
+        const issuedCoordX = resolvedAction.coord_x;
+        const issuedCoordY = resolvedAction.coord_y;
+        const issuedAction = resolvedAction.issuedAction;
+
+        const result = await apiRequest(
+          `/equipes/${TEAM_ID}/vaisseaux/${encodeURIComponent(shipId)}/demander-action`,
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+              action: issuedAction,
+              coord_x: issuedCoordX,
+              coord_y: issuedCoordY
+            })
+          }
+        );
+
+        occupiedCells.add(
+          issuedAction === "DEPLACEMENT"
+            ? getCellKey(issuedCoordX, issuedCoordY)
+            : getCellKey(ship.coord_x, ship.coord_y)
+        );
+
+        results.push({
+          shipId,
+          shipName: ship.nom,
+          ok: true,
+          status: 200,
+          result,
+          issuedCoord: {
+            coord_x: issuedCoordX,
+            coord_y: issuedCoordY
+          },
+          requestedCoord: {
+            coord_x: coordX,
+            coord_y: coordY
+          },
+          requestedAction: action,
+          issuedAction,
+          completed: Boolean(resolvedAction.completed)
+        });
+      } catch (error) {
+        occupiedCells.add(getCellKey(ship.coord_x, ship.coord_y));
+
+        results.push({
+          shipId,
+          shipName: ship.nom,
+          ok: false,
+          status: Number.isInteger(error.status) ? error.status : 500,
+          error: error.message
+        });
+      }
+    }
+
+    const success = results.filter((entry) => entry.ok).length;
+
+    res.json({
+      action,
+      target: {
+        coord_x: coordX,
+        coord_y: coordY
+      },
+      summary: {
+        requested: uniqueShipIds.length,
+        success,
+        failed: uniqueShipIds.length - success
+      },
+      results
     });
   } catch (error) {
     next(error);
