@@ -6,6 +6,18 @@ const BASE_CELL_SIZE = 50;
 const CLICKABLE_PLANET_SQUARE_SIZE = 18;
 const PLANET_RENDER_PADDING = 6;
 const DEMO_MODE_ENABLED = new URLSearchParams(window.location.search).get('demo') === '1';
+const TEAM_COLOR_PALETTE = [
+  '#6ff7ff',
+  '#ff4d74',
+  '#ffb347',
+  '#8fff6f',
+  '#8ab4ff',
+  '#ffd86f',
+  '#ff8ad8',
+  '#b78cff',
+  '#7fffd4',
+  '#ff9a6f'
+];
 const ACTION_BUTTONS = [
   { action: 'DEPLACEMENT', label: 'Move', tone: 'neutral' },
   { action: 'ATTAQUER', label: 'Attack', tone: 'danger' },
@@ -204,6 +216,30 @@ function shortShipLabel(name) {
   return name.length > 14 ? `${name.slice(0, 12)}..` : name;
 }
 
+function hashLabel(value) {
+  const text = String(value ?? '');
+  let hash = 0;
+
+  for (let index = 0; index < text.length; index += 1) {
+    hash = ((hash << 5) - hash) + text.charCodeAt(index);
+    hash |= 0;
+  }
+
+  return Math.abs(hash);
+}
+
+function getOwnerColor(ownerName, currentTeamName) {
+  if (!ownerName) {
+    return '#ffe1ff';
+  }
+
+  if (currentTeamName && ownerName === currentTeamName) {
+    return '#6ff7ff';
+  }
+
+  return TEAM_COLOR_PALETTE[hashLabel(ownerName) % TEAM_COLOR_PALETTE.length];
+}
+
 function getShipReadyDelayMs(ship) {
   if (!ship?.cooldown) {
     return 0;
@@ -367,6 +403,36 @@ function parseSnapshot(stateData, mapCells) {
   };
 }
 
+function parsePlanetCatalog(mapCells) {
+  const parsedPlanets = [];
+
+  mapCells.forEach((cell, cellIndex) => {
+    const cellX = parseNumber(cell.coord_x ?? cell.x);
+    const cellY = parseNumber(cell.coord_y ?? cell.y);
+
+    if (!cell.planete || cell.planete.estVide) {
+      return;
+    }
+
+    parsedPlanets.push({
+      kind: 'planet',
+      id: String(cell.planete.identifiant ?? `planet-${cellX}-${cellY}-${cellIndex}`),
+      displayName: cell.planete.nom ?? `Planete ${cellX}:${cellY}`,
+      x: parseNumber(cell.planete.coord_x ?? cellX),
+      y: parseNumber(cell.planete.coord_y ?? cellY),
+      hp: parseNumber(cell.planete.pointDeVie),
+      minerals: parseNumber(cell.planete.mineraiDisponible),
+      slots: parseNumber(cell.planete.slotsConstruction),
+      biome: cell.planete.biome ?? cell.planete.modelePlanete?.biome,
+      typePlanete: cell.planete.typePlanete ?? cell.planete.modelePlanete?.typePlanete,
+      owner: cell.proprietaire?.nom || cell.proprietaire?.identifiant || null,
+      category: 'PLANET'
+    });
+  });
+
+  return parsedPlanets;
+}
+
 function parseGlobalEnemyShips(payload, teamId) {
   return (payload?.ships ?? [])
     .filter((ship) => String(ship.proprietaire?.identifiant ?? '') !== String(teamId ?? ''))
@@ -496,12 +562,20 @@ function App() {
   });
   const leaderboardFetchedAtRef = useRef(0);
   const enemyShipsFetchedAtRef = useRef(0);
+  const planetsFetchedAtRef = useRef(0);
 
   useEffect(() => () => {
     if (suppressClickTimeoutRef.current) {
       window.clearTimeout(suppressClickTimeoutRef.current);
     }
   }, []);
+
+  useEffect(() => {
+    document.body.classList.toggle('dragging-map', isDragging);
+    return () => {
+      document.body.classList.remove('dragging-map');
+    };
+  }, [isDragging]);
 
   const fetchData = async ({ mode = 'focus', forceLeaderboard = false } = {}) => {
     if (fetchInFlightRef.current) {
@@ -524,9 +598,14 @@ function App() {
         forceLeaderboard || Date.now() - leaderboardFetchedAtRef.current > 20_000;
       const shouldFetchEnemyShips =
         forceLeaderboard || Date.now() - enemyShipsFetchedAtRef.current > 12_000;
+      const shouldFetchPlanetCatalog =
+        mode === 'initial' ||
+        planets.length === 0 ||
+        Date.now() - planetsFetchedAtRef.current > 45_000;
       const requests = [fetch(`/api/state?${buildRangeQuery(range)}&include_plan=0`)];
       let leaderboardIndex = -1;
       let enemyShipsIndex = -1;
+      let planetsIndex = -1;
 
       if (shouldFetchLeaderboard) {
         leaderboardIndex = requests.length;
@@ -538,10 +617,16 @@ function App() {
         requests.push(fetch('/api/vaisseaux/all').catch(() => null));
       }
 
+      if (shouldFetchPlanetCatalog) {
+        planetsIndex = requests.length;
+        requests.push(fetch(`/api/map?x_range=0,${FULL_MAP - 1}&y_range=0,${FULL_MAP - 1}`).catch(() => null));
+      }
+
       const settledResults = await Promise.allSettled(requests);
       const stateResult = settledResults[0];
       const leaderResult = leaderboardIndex >= 0 ? settledResults[leaderboardIndex] : null;
       const enemyShipsResult = enemyShipsIndex >= 0 ? settledResults[enemyShipsIndex] : null;
+      const planetsResult = planetsIndex >= 0 ? settledResults[planetsIndex] : null;
 
       if (stateResult.status !== 'fulfilled' || !stateResult.value.ok) {
         const status = stateResult.status === 'fulfilled' ? stateResult.value.status : 'offline';
@@ -556,6 +641,13 @@ function App() {
         enemyShipsResult.value &&
         enemyShipsResult.value.ok
           ? parseGlobalEnemyShips(await enemyShipsResult.value.json(), stateData.teamId)
+          : null;
+      const globalPlanets =
+        shouldFetchPlanetCatalog &&
+        planetsResult?.status === 'fulfilled' &&
+        planetsResult.value &&
+        planetsResult.value.ok
+          ? parsePlanetCatalog((await planetsResult.value.json()).cells || [])
           : null;
       setLastSyncedAt(stateData.fetchedAt ?? new Date().toISOString());
 
@@ -575,9 +667,11 @@ function App() {
         ];
       });
       setPlanets((previousPlanets) =>
-        mode === 'initial' || previousPlanets.length === 0
-          ? parsed.planets
-          : mergePlanets(previousPlanets, parsed.planets)
+        globalPlanets
+          ? mergePlanets(globalPlanets, parsed.planets)
+          : mode === 'initial' || previousPlanets.length === 0
+            ? parsed.planets
+            : mergePlanets(previousPlanets, parsed.planets)
       );
       setFetchError('');
 
@@ -596,6 +690,10 @@ function App() {
 
       if (globalEnemyShips) {
         enemyShipsFetchedAtRef.current = Date.now();
+      }
+
+      if (globalPlanets) {
+        planetsFetchedAtRef.current = Date.now();
       }
     } catch (error) {
       console.error('Fetch failed:', error);
@@ -781,7 +879,8 @@ function App() {
         cellKey: `${planet.x},${planet.y}`,
         isVisible: visiblePlanetCells.has(`${planet.x},${planet.y}`),
         isSelected: selected?.kind === 'planet' && selected.id === planet.id,
-        isOwned: Boolean(planet.owner && planet.owner === team?.nom)
+        isOwned: Boolean(planet.owner && planet.owner === team?.nom),
+        ownerColor: getOwnerColor(planet.owner, team?.nom)
       })),
     [planets, selected, team?.nom, visiblePlanetCells]
   );
@@ -913,6 +1012,8 @@ function App() {
     if (event.button !== 0) {
       return;
     }
+
+    event.preventDefault();
 
     if (suppressClickTimeoutRef.current) {
       window.clearTimeout(suppressClickTimeoutRef.current);
@@ -1167,10 +1268,26 @@ function App() {
             return (
               <div
                 key={planet.id}
-                className="map-object planet-object ghost"
+                className={`map-object planet-object ghost ${planet.owner ? 'owned-planet' : ''}`}
                 style={style}
               >
+                {planet.owner && (
+                  <span
+                    className="planet-owner-ring ghost"
+                    style={{
+                      '--planet-owner-color': planet.ownerColor
+                    }}
+                  />
+                )}
                 <PlanetImage planet={planet} />
+                {planet.owner && (
+                  <span
+                    className="planet-tag owned-by-team ghost"
+                    style={{ '--planet-owner-color': planet.ownerColor }}
+                  >
+                    {shortShipLabel(planet.displayName)}
+                  </span>
+                )}
               </div>
             );
           }
@@ -1181,13 +1298,27 @@ function App() {
               type="button"
               className={`map-object planet-object interactive-object ${planet.isSelected ? 'selected-target' : ''} ${planet.isOwned ? 'owned-planet' : ''}`}
               style={style}
-              onMouseDown={(event) => event.stopPropagation()}
+              onMouseDown={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+              }}
               onDragStart={(event) => event.preventDefault()}
               onClick={() => handlePlanetClick(planet)}
             >
+              {planet.owner && (
+                <span
+                  className="planet-owner-ring"
+                  style={{
+                    '--planet-owner-color': planet.ownerColor
+                  }}
+                />
+              )}
               <PlanetImage planet={planet} />
               {(planet.isOwned || planet.isSelected || planet.isVisible) && (
-                <span className={`planet-tag ${planet.isOwned ? 'owned' : 'neutral'}`}>
+                <span
+                  className={`planet-tag ${planet.isOwned ? 'owned' : 'neutral'} ${planet.owner ? 'owned-by-team' : ''}`}
+                  style={planet.owner ? { '--planet-owner-color': planet.ownerColor } : undefined}
+                >
                   {shortShipLabel(planet.displayName)}
                 </span>
               )}
@@ -1222,7 +1353,10 @@ function App() {
                 left: `${ship.x * BASE_CELL_SIZE}px`,
                 top: `${ship.y * BASE_CELL_SIZE}px`
               }}
-              onMouseDown={(event) => event.stopPropagation()}
+              onMouseDown={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+              }}
               onDragStart={(event) => event.preventDefault()}
               onClick={() => handleShipClick(ship)}
             >

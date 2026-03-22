@@ -36,6 +36,13 @@ body {
   overflow: hidden;
 }
 
+body.dragging-map,
+body.dragging-map * {
+  user-select: none !important;
+  -webkit-user-select: none !important;
+  cursor: grabbing !important;
+}
+
 button,
 input {
   font: inherit;
@@ -46,6 +53,8 @@ input {
   height: 100vh;
   position: relative;
   overflow: hidden;
+  user-select: none;
+  -webkit-user-select: none;
 }
 
 .loading {
@@ -73,6 +82,8 @@ input {
   background-size: 50px 50px, 50px 50px, 100% 100%;
   background-color: #120014;
   z-index: 10;
+  user-select: none;
+  -webkit-user-select: none;
 }
 
 .map-grid {
@@ -89,6 +100,8 @@ input {
   align-items: center;
   justify-content: center;
   transform: translateZ(0);
+  user-select: none;
+  -webkit-user-select: none;
 }
 
 .interactive-object {
@@ -118,9 +131,37 @@ input {
   pointer-events: none;
 }
 
+.planet-owner-ring {
+  position: absolute;
+  inset: 7px;
+  border-radius: 999px;
+  border: 2px solid var(--planet-owner-color, rgba(255, 225, 255, 0.7));
+  box-shadow:
+    0 0 18px color-mix(in srgb, var(--planet-owner-color, #ffe1ff) 35%, transparent),
+    inset 0 0 10px color-mix(in srgb, var(--planet-owner-color, #ffe1ff) 28%, transparent);
+  background: radial-gradient(
+    circle,
+    color-mix(in srgb, var(--planet-owner-color, #ffe1ff) 14%, transparent) 0%,
+    transparent 72%
+  );
+  opacity: 0.92;
+  pointer-events: none;
+}
+
 .planet-object.ghost {
   pointer-events: none;
   opacity: 0.42;
+}
+
+.planet-object.ghost.owned-planet {
+  opacity: 0.74;
+}
+
+.planet-owner-ring.ghost {
+  opacity: 0.72;
+  box-shadow:
+    0 0 12px color-mix(in srgb, var(--planet-owner-color, #ffe1ff) 28%, transparent),
+    inset 0 0 6px color-mix(in srgb, var(--planet-owner-color, #ffe1ff) 22%, transparent);
 }
 
 .ship-object {
@@ -252,6 +293,17 @@ input {
 
 .planet-tag.neutral {
   color: var(--accent-bright);
+}
+
+.planet-tag.owned-by-team {
+  color: var(--planet-owner-color, #fff);
+  border-color: color-mix(in srgb, var(--planet-owner-color, #fff) 45%, transparent);
+  background: color-mix(in srgb, var(--planet-owner-color, #fff) 12%, rgba(5, 0, 8, 0.92));
+  box-shadow: 0 0 12px color-mix(in srgb, var(--planet-owner-color, #fff) 18%, transparent);
+}
+
+.planet-tag.ghost {
+  opacity: 0.82;
 }
 
 .ship-tag.friendly {
