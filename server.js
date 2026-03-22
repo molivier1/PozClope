@@ -556,12 +556,49 @@ async function resolveSmartShipAction(ship, requestedAction, targetCoord, occupi
   const cellsByCoord = new Map(
     cells.map((cell) => [getCellKey(cell.coord_x, cell.coord_y), cell])
   );
+  const targetCell = cellsByCoord.get(getCellKey(target.x, target.y)) ?? null;
   const inRange = chebyshevDistance(current, target) === 1;
 
   if (inRange) {
+    if (requestedAction === "ATTAQUER") {
+      const hasTargetPlanet = Boolean(targetCell?.planete && !targetCell.planete.estVide);
+      const hasHostileShip = (targetCell?.vaisseaux ?? []).some(
+        (targetShip) => targetShip?.proprietaire?.identifiant !== TEAM_ID
+      );
+
+      if (!hasTargetPlanet && !hasHostileShip) {
+        return {
+          issuedAction: "ATTAQUER",
+          coord_x: target.x,
+          coord_y: target.y,
+          completed: true,
+          skipped: true,
+          reason: "Plus aucune cible sur cette case."
+        };
+      }
+
+      return {
+        issuedAction: "ATTAQUER",
+        coord_x: target.x,
+        coord_y: target.y,
+        completed: false
+      };
+    }
+
     if (requestedAction === "CONQUERIR") {
-      const targetCell = cellsByCoord.get(getCellKey(target.x, target.y));
       const targetHp = Number(targetCell?.planete?.pointDeVie ?? 0);
+      const ownerId = targetCell?.proprietaire?.identifiant ?? null;
+
+      if (ownerId && String(ownerId) === String(TEAM_ID)) {
+        return {
+          issuedAction: "CONQUERIR",
+          coord_x: target.x,
+          coord_y: target.y,
+          completed: true,
+          skipped: true,
+          reason: "Planete deja conquise."
+        };
+      }
 
       if (targetHp > 0) {
         return {
@@ -571,6 +608,97 @@ async function resolveSmartShipAction(ship, requestedAction, targetCoord, occupi
           completed: false
         };
       }
+
+      return {
+        issuedAction: "CONQUERIR",
+        coord_x: target.x,
+        coord_y: target.y,
+        completed: false
+      };
+    }
+
+    if (requestedAction === "RECOLTER") {
+      const cargo = Number(ship.mineraiTransporte ?? 0);
+      const capacity = Number(ship.capaciteTransport ?? 0);
+      const minerai = Number(targetCell?.planete?.mineraiDisponible ?? 0);
+
+      if (capacity > 0 && cargo >= capacity) {
+        return {
+          issuedAction: "RECOLTER",
+          coord_x: target.x,
+          coord_y: target.y,
+          completed: true,
+          skipped: true,
+          reason: "Soute pleine."
+        };
+      }
+
+      if (minerai <= 0) {
+        return {
+          issuedAction: "RECOLTER",
+          coord_x: target.x,
+          coord_y: target.y,
+          completed: true,
+          skipped: true,
+          reason: "Mine vide."
+        };
+      }
+
+      return {
+        issuedAction: "RECOLTER",
+        coord_x: target.x,
+        coord_y: target.y,
+        completed: false
+      };
+    }
+
+    if (requestedAction === "DEPOSER") {
+      const cargo = Number(ship.mineraiTransporte ?? 0);
+
+      if (cargo <= 0) {
+        return {
+          issuedAction: "DEPOSER",
+          coord_x: target.x,
+          coord_y: target.y,
+          completed: true,
+          skipped: true,
+          reason: "Cale vide."
+        };
+      }
+
+      return {
+        issuedAction: "DEPOSER",
+        coord_x: target.x,
+        coord_y: target.y,
+        completed: false
+      };
+    }
+
+    if (requestedAction === "REPARER") {
+      const maxHp = Number(
+        ship.pointDeVieMax ??
+          ship.modeleVaisseau?.pointDeVie ??
+          ship.type?.pointDeVie ??
+          0
+      );
+
+      if (maxHp > 0 && Number(ship.pointDeVie ?? 0) >= maxHp) {
+        return {
+          issuedAction: "REPARER",
+          coord_x: target.x,
+          coord_y: target.y,
+          completed: true,
+          skipped: true,
+          reason: "Vaisseau deja repare."
+        };
+      }
+
+      return {
+        issuedAction: "REPARER",
+        coord_x: target.x,
+        coord_y: target.y,
+        completed: maxHp <= 0
+      };
     }
 
     return {
@@ -705,6 +833,12 @@ function normalizeShip(ship, index, fallbackCoords = {}) {
     coord_x: x,
     coord_y: y,
     pointDeVie: Number(ship.pointDeVie ?? 0),
+    pointDeVieMax: Number(
+      ship.pointDeVieMax ??
+        ship.modeleVaisseau?.pointDeVie ??
+        ship.type?.pointDeVie ??
+        0
+    ),
     vitesse: Number(ship.vitesse ?? 0),
     mineraiTransporte: Number(ship.mineraiTransporte ?? 0),
     capaciteTransport: Number(
@@ -814,23 +948,126 @@ function normalizeShipName(value) {
     .toLowerCase();
 }
 
-function getActiveShipNameSet(teamPayload) {
-  return new Set(
-    extractArray(teamPayload?.vaisseaux)
-      .map((ship) => ship?.nom)
-      .filter(Boolean)
-      .map((name) => normalizeShipName(name))
-  );
+function getRawShipId(ship) {
+  const value =
+    ship?.identifiant ??
+    ship?.idVaisseau ??
+    ship?.id ??
+    null;
+
+  return value === null || value === undefined ? null : String(value);
+}
+
+function normalizeCooldownValue(value) {
+  return value === null || value === undefined ? "" : String(value);
+}
+
+function isOriginGhostShip(ship) {
+  return Number(ship?.coord_x ?? ship?.x ?? 0) === 0 && Number(ship?.coord_y ?? ship?.y ?? 0) === 0;
+}
+
+function getActiveShipSets(teamPayload) {
+  const ids = new Set();
+  const names = new Map();
+
+  for (const ship of extractArray(teamPayload?.vaisseaux)) {
+    const id = getRawShipId(ship);
+    const name = ship?.nom;
+
+    if (id) {
+      ids.add(id);
+    }
+
+    if (name) {
+      const key = normalizeShipName(name);
+      const entries = names.get(key) ?? [];
+      entries.push({
+        cooldown: normalizeCooldownValue(ship?.dateProchaineAction ?? ship?.cooldown),
+        minerai: Number(ship?.mineraiTransporte ?? ship?.minerai ?? 0),
+        pointDeVie: Number(ship?.pointDeVie ?? 0)
+      });
+      names.set(key, entries);
+    }
+  }
+
+  return { ids, names };
+}
+
+function scoreShipCandidate(ship, referenceEntries) {
+  const cooldown = normalizeCooldownValue(ship?.dateProchaineAction ?? ship?.cooldown);
+  const minerai = Number(ship?.mineraiTransporte ?? ship?.minerai ?? 0);
+  const pointDeVie = Number(ship?.pointDeVie ?? 0);
+
+  let score = 0;
+
+  if (!isOriginGhostShip(ship)) {
+    score += 1000;
+  }
+
+  if (referenceEntries.some((entry) => entry.cooldown && entry.cooldown === cooldown)) {
+    score += 100;
+  }
+
+  if (referenceEntries.some((entry) => entry.minerai === minerai)) {
+    score += 10;
+  }
+
+  if (pointDeVie > 0 && referenceEntries.some((entry) => entry.pointDeVie === pointDeVie)) {
+    score += 5;
+  }
+
+  return score;
 }
 
 function filterActiveShips(ships, teamPayload) {
-  const activeNames = getActiveShipNameSet(teamPayload);
+  const { ids: activeIds, names: activeNames } = getActiveShipSets(teamPayload);
 
-  if (activeNames.size === 0) {
+  if (activeIds.size === 0 && activeNames.size === 0) {
     return ships;
   }
 
-  return ships.filter((ship) => activeNames.has(normalizeShipName(ship.nom)));
+  const byName = new Map();
+
+  for (const ship of ships) {
+    const shipId = getRawShipId(ship);
+    const shipNameKey = normalizeShipName(ship.nom);
+
+    if (shipId && activeIds.size > 0) {
+      if (activeIds.has(shipId)) {
+        const bucket = byName.get(shipNameKey) ?? [];
+        bucket.push(ship);
+        byName.set(shipNameKey, bucket);
+        continue;
+      }
+    }
+
+    if (activeNames.has(shipNameKey)) {
+      const bucket = byName.get(shipNameKey) ?? [];
+      bucket.push(ship);
+      byName.set(shipNameKey, bucket);
+    }
+  }
+
+  const filtered = [];
+
+  for (const [nameKey, referenceEntries] of activeNames.entries()) {
+    const candidates = byName.get(nameKey) ?? [];
+
+    candidates.sort((left, right) => {
+      const scoreGap = scoreShipCandidate(right, referenceEntries) - scoreShipCandidate(left, referenceEntries);
+
+      if (scoreGap !== 0) {
+        return scoreGap;
+      }
+
+      return normalizeCooldownValue(right.dateProchaineAction ?? right.cooldown)
+        .localeCompare(normalizeCooldownValue(left.dateProchaineAction ?? left.cooldown));
+    });
+
+    filtered.push(...candidates.slice(0, referenceEntries.length));
+  }
+
+  return filtered;
 }
 
 function getOwnerKey(owner) {
@@ -2105,24 +2342,30 @@ app.post("/api/actions/ships", ensureConfig, async (req, res, next) => {
         const issuedCoordX = resolvedAction.coord_x;
         const issuedCoordY = resolvedAction.coord_y;
         const issuedAction = resolvedAction.issuedAction;
+        const skipped = Boolean(resolvedAction.skipped);
 
-        const result = await apiRequest(
-          `/equipes/${TEAM_ID}/vaisseaux/${encodeURIComponent(shipId)}/demander-action`,
-          {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json"
-            },
-            body: JSON.stringify({
-              action: issuedAction,
-              coord_x: issuedCoordX,
-              coord_y: issuedCoordY
-            })
-          }
-        );
+        const result = skipped
+          ? {
+              skipped: true,
+              reason: resolvedAction.reason ?? null
+            }
+          : await apiRequest(
+              `/equipes/${TEAM_ID}/vaisseaux/${encodeURIComponent(shipId)}/demander-action`,
+              {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json"
+                },
+                body: JSON.stringify({
+                  action: issuedAction,
+                  coord_x: issuedCoordX,
+                  coord_y: issuedCoordY
+                })
+              }
+            );
 
         occupiedCells.add(
-          issuedAction === "DEPLACEMENT"
+          !skipped && issuedAction === "DEPLACEMENT"
             ? getCellKey(issuedCoordX, issuedCoordY)
             : getCellKey(ship.coord_x, ship.coord_y)
         );
@@ -2143,6 +2386,8 @@ app.post("/api/actions/ships", ensureConfig, async (req, res, next) => {
           },
           requestedAction: action,
           issuedAction,
+          skipped,
+          reason: resolvedAction.reason ?? null,
           completed: Boolean(resolvedAction.completed)
         });
       } catch (error) {

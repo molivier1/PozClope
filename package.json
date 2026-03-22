@@ -13,17 +13,21 @@
     "getmodel": "node scripts/getmodel.js",
     "socket-watch": "node scripts/socket-watch.js",
     "scrap": "node scripts/scrap-ships.js",
+    "hunt": "node scripts/hunt-ship.js",
     "siege": "node scripts/siege.js",
     "siege:auto": "node scripts/siege-plus.js",
+    "siege:friendly": "node scripts/siege-friendly.js",
     "rally": "node scripts/rally-combat.js",
     "farm": "node scripts/farm.js",
     "farm-cargos": "node scripts/farm-cargos.js"
   },
   "dependencies": {
+    "@stomp/stompjs": "^7.3.0",
     "dotenv": "^17.3.1",
     "express": "^5.2.1",
     "react": "^18.2.0",
-    "react-dom": "^18.2.0"
+    "react-dom": "^18.2.0",
+    "sockjs-client": "^1.6.1"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.0.0",

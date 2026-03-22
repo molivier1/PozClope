@@ -208,6 +208,75 @@ function parseNumber(value, fallback = 0) {
   return Number.isFinite(numeric) ? numeric : fallback;
 }
 
+function isOpaqueTeamIdentifier(value) {
+  const text = String(value ?? '').trim();
+
+  if (!text) {
+    return false;
+  }
+
+  return (
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(text) ||
+    /^[0-9a-f]{32}$/i.test(text)
+  );
+}
+
+function registerOwnerName(ownerLookup, ownerLike) {
+  if (!ownerLookup || !ownerLike || typeof ownerLike !== 'object') {
+    return;
+  }
+
+  const ownerId = ownerLike.identifiant ?? ownerLike.id ?? null;
+  const ownerName = String(ownerLike.nom ?? ownerLike.name ?? '').trim();
+
+  if (!ownerId || !ownerName || isOpaqueTeamIdentifier(ownerName)) {
+    return;
+  }
+
+  ownerLookup.set(String(ownerId), ownerName);
+}
+
+function resolveOwnerName(ownerLike, ownerLookup, fallback = null) {
+  if (!ownerLike) {
+    return fallback;
+  }
+
+  if (typeof ownerLike === 'string') {
+    const normalizedOwner = ownerLike.trim();
+
+    if (!normalizedOwner) {
+      return fallback;
+    }
+
+    const mappedOwner = ownerLookup?.get(normalizedOwner);
+    if (mappedOwner) {
+      return mappedOwner;
+    }
+
+    return isOpaqueTeamIdentifier(normalizedOwner) ? fallback : normalizedOwner;
+  }
+
+  const explicitName = String(ownerLike.nom ?? ownerLike.name ?? '').trim();
+  if (explicitName && !isOpaqueTeamIdentifier(explicitName)) {
+    return explicitName;
+  }
+
+  const ownerId = ownerLike.identifiant ?? ownerLike.id ?? null;
+  if (ownerId != null) {
+    const mappedOwner = ownerLookup?.get(String(ownerId));
+    if (mappedOwner) {
+      return mappedOwner;
+    }
+
+    const ownerIdText = String(ownerId).trim();
+    if (ownerIdText && !isOpaqueTeamIdentifier(ownerIdText)) {
+      return ownerIdText;
+    }
+  }
+
+  return fallback;
+}
+
 function shortShipLabel(name) {
   if (!name) {
     return 'SHIP';
@@ -334,7 +403,7 @@ function computeFocusRange(friendlyShips, selected, selectedShips, actionTargetP
   };
 }
 
-function parseSnapshot(stateData, mapCells) {
+function parseSnapshot(stateData, mapCells, ownerLookup = new Map()) {
   const parsedShips = (stateData.ships ?? []).map((ship, index) => ({
     kind: 'ship',
     id: String(ship.identifiant ?? ship.id ?? `${ship.nom}-${index}`),
@@ -370,7 +439,7 @@ function parseSnapshot(stateData, mapCells) {
         slots: parseNumber(cell.planete.slotsConstruction),
         biome: cell.planete.biome ?? cell.planete.modelePlanete?.biome,
         typePlanete: cell.planete.typePlanete ?? cell.planete.modelePlanete?.typePlanete,
-        owner: cell.proprietaire?.nom || cell.proprietaire?.identifiant || null,
+        owner: resolveOwnerName(cell.proprietaire, ownerLookup, null),
         category: 'PLANET'
       });
     }
@@ -391,7 +460,7 @@ function parseSnapshot(stateData, mapCells) {
         cargo: parseNumber(ship.mineraiTransporte),
         className: ship.classeVaisseau ?? 'ENEMY',
         isEnemy: true,
-        owner: ship.proprietaire.nom || ship.proprietaire.identifiant || 'Ennemi'
+        owner: resolveOwnerName(ship.proprietaire, ownerLookup, 'Ennemi')
       });
     });
   });
@@ -403,7 +472,7 @@ function parseSnapshot(stateData, mapCells) {
   };
 }
 
-function parsePlanetCatalog(mapCells) {
+function parsePlanetCatalog(mapCells, ownerLookup = new Map()) {
   const parsedPlanets = [];
 
   mapCells.forEach((cell, cellIndex) => {
@@ -425,7 +494,7 @@ function parsePlanetCatalog(mapCells) {
       slots: parseNumber(cell.planete.slotsConstruction),
       biome: cell.planete.biome ?? cell.planete.modelePlanete?.biome,
       typePlanete: cell.planete.typePlanete ?? cell.planete.modelePlanete?.typePlanete,
-      owner: cell.proprietaire?.nom || cell.proprietaire?.identifiant || null,
+      owner: resolveOwnerName(cell.proprietaire, ownerLookup, null),
       category: 'PLANET'
     });
   });
@@ -433,7 +502,7 @@ function parsePlanetCatalog(mapCells) {
   return parsedPlanets;
 }
 
-function parseGlobalEnemyShips(payload, teamId) {
+function parseGlobalEnemyShips(payload, teamId, ownerLookup = new Map()) {
   return (payload?.ships ?? [])
     .filter((ship) => String(ship.proprietaire?.identifiant ?? '') !== String(teamId ?? ''))
     .map((ship, index) => ({
@@ -450,7 +519,7 @@ function parseGlobalEnemyShips(payload, teamId) {
       capacity: parseNumber(ship.capaciteTransport),
       cooldown: ship.dateProchaineAction ?? null,
       isEnemy: true,
-      owner: ship.proprietaire?.nom || ship.proprietaire?.identifiant || 'Ennemi'
+      owner: resolveOwnerName(ship.proprietaire, ownerLookup, 'Ennemi')
     }));
 }
 
@@ -563,6 +632,7 @@ function App() {
   const leaderboardFetchedAtRef = useRef(0);
   const enemyShipsFetchedAtRef = useRef(0);
   const planetsFetchedAtRef = useRef(0);
+  const ownerNameByIdRef = useRef(new Map());
 
   useEffect(() => () => {
     if (suppressClickTimeoutRef.current) {
@@ -634,21 +704,44 @@ function App() {
       }
 
       const stateData = await stateResult.value.json();
-      const parsed = parseSnapshot(stateData, stateData.cells || []);
-      const globalEnemyShips =
+      const enemyShipsPayload =
         shouldFetchEnemyShips &&
         enemyShipsResult?.status === 'fulfilled' &&
         enemyShipsResult.value &&
         enemyShipsResult.value.ok
-          ? parseGlobalEnemyShips(await enemyShipsResult.value.json(), stateData.teamId)
+          ? await enemyShipsResult.value.json()
           : null;
-      const globalPlanets =
+      const planetsPayload =
         shouldFetchPlanetCatalog &&
         planetsResult?.status === 'fulfilled' &&
         planetsResult.value &&
         planetsResult.value.ok
-          ? parsePlanetCatalog((await planetsResult.value.json()).cells || [])
+          ? await planetsResult.value.json()
           : null;
+      const ownerLookup = new Map(ownerNameByIdRef.current);
+
+      registerOwnerName(ownerLookup, {
+        identifiant: stateData.teamId,
+        nom: stateData.team?.nom
+      });
+      (stateData.cells || []).forEach((cell) => {
+        registerOwnerName(ownerLookup, cell.proprietaire);
+        (cell.vaisseaux ?? []).forEach((ship) => {
+          registerOwnerName(ownerLookup, ship.proprietaire);
+        });
+      });
+      (enemyShipsPayload?.ships ?? []).forEach((ship) => {
+        registerOwnerName(ownerLookup, ship.proprietaire);
+      });
+      ownerNameByIdRef.current = ownerLookup;
+
+      const parsed = parseSnapshot(stateData, stateData.cells || [], ownerLookup);
+      const globalEnemyShips = enemyShipsPayload
+        ? parseGlobalEnemyShips(enemyShipsPayload, stateData.teamId, ownerLookup)
+        : null;
+      const globalPlanets = planetsPayload
+        ? parsePlanetCatalog(planetsPayload.cells || [], ownerLookup)
+        : null;
       setLastSyncedAt(stateData.fetchedAt ?? new Date().toISOString());
 
       setTeam(stateData.team ?? null);
@@ -979,12 +1072,39 @@ function App() {
     }
   };
 
+  const clearTacticalState = () => {
+    setSelectedShipIds([]);
+    setSelected(null);
+    setActionTarget({ x: '', y: '' });
+    setActiveCommandPlan(null);
+    setActionPending('');
+    setActionFeedback(null);
+    appendLog('Commande auto stoppee.', 'warn');
+  };
+
   const handleShipClick = (ship) => {
     if (suppressClickRef.current || dragMovedRef.current) {
       return;
     }
 
     if (ship.isEnemy) {
+      const planetOnShipCell = planets.find(
+        (planet) => planet.x === ship.x && planet.y === ship.y
+      );
+
+      if (
+        planetOnShipCell &&
+        selected?.kind === 'ship' &&
+        selected.id === ship.id
+      ) {
+        setSelected(planetOnShipCell);
+        setActionTarget({
+          x: String(planetOnShipCell.x),
+          y: String(planetOnShipCell.y)
+        });
+        return;
+      }
+
       setSelected(ship);
       setActionTarget({
         x: String(ship.x),
@@ -1266,10 +1386,17 @@ function App() {
 
           if (!planet.isVisible) {
             return (
-              <div
+              <button
                 key={planet.id}
-                className={`map-object planet-object ghost ${planet.owner ? 'owned-planet' : ''}`}
+                type="button"
+                className={`map-object planet-object interactive-object ghost ${planet.owner ? 'owned-planet' : ''} ${planet.isSelected ? 'selected-target' : ''}`}
                 style={style}
+                onMouseDown={(event) => {
+                  event.preventDefault();
+                  event.stopPropagation();
+                }}
+                onDragStart={(event) => event.preventDefault()}
+                onClick={() => handlePlanetClick(planet)}
               >
                 {planet.owner && (
                   <span
@@ -1288,7 +1415,7 @@ function App() {
                     {shortShipLabel(planet.displayName)}
                   </span>
                 )}
-              </div>
+              </button>
             );
           }
 
@@ -1465,7 +1592,7 @@ function App() {
           <button type="button" className="tiny-button" onClick={() => selectShipPreset('combat')}>Combat</button>
           <button type="button" className="tiny-button" onClick={() => selectShipPreset('cargos')}>Cargos</button>
           <button type="button" className="tiny-button" onClick={() => selectShipPreset('all')}>Tous</button>
-          <button type="button" className="tiny-button ghost" onClick={() => setSelectedShipIds([])}>Clear</button>
+          <button type="button" className="tiny-button ghost" onClick={clearTacticalState}>Clear</button>
         </div>
 
         <div className="roster-list">

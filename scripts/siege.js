@@ -13,6 +13,10 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function getCycleSleepDelay(cycleStartedAt, minDelayMs) {
+  return Math.max(cycleStartedAt + minDelayMs - Date.now(), 0);
+}
+
 function parseNumber(value, fallback) {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
@@ -139,6 +143,19 @@ function buildAdjacentCells(target) {
   return cells;
 }
 
+function buildSearchNeighbors(origin, destination) {
+  return buildAdjacentCells(origin).sort((left, right) => {
+    const leftScore = chebyshevDistance(left, destination);
+    const rightScore = chebyshevDistance(right, destination);
+
+    if (leftScore !== rightScore) {
+      return leftScore - rightScore;
+    }
+
+    return left.x - right.x || left.y - right.y;
+  });
+}
+
 function nextStepToward(ship, target) {
   return {
     x: getX(ship) + Math.sign(getX(target) - getX(ship)),
@@ -146,7 +163,165 @@ function nextStepToward(ship, target) {
   };
 }
 
-function pickStagingCell(ship, target, occupiedCells, lookup) {
+function findPathStep(ship, target, occupiedCells, lookup) {
+  const startKey = getCellKey(getX(ship), getY(ship));
+  const targetKey = getCellKey(target.x, target.y);
+
+  if (startKey === targetKey) {
+    return null;
+  }
+
+  const queue = [{ x: getX(ship), y: getY(ship) }];
+  const visited = new Set([startKey]);
+  const firstStepByKey = new Map();
+
+  while (queue.length > 0) {
+    const current = queue.shift();
+    const currentKey = getCellKey(current.x, current.y);
+
+    for (const neighbor of buildSearchNeighbors(current, target)) {
+      const neighborKey = getCellKey(neighbor.x, neighbor.y);
+
+      if (visited.has(neighborKey)) {
+        continue;
+      }
+
+      if (isOccupiedCell(neighbor.x, neighbor.y, occupiedCells)) {
+        continue;
+      }
+
+      if (!isPassableCoord(neighbor.x, neighbor.y, lookup)) {
+        continue;
+      }
+
+      visited.add(neighborKey);
+      firstStepByKey.set(
+        neighborKey,
+        currentKey === startKey ? neighbor : firstStepByKey.get(currentKey)
+      );
+
+      if (neighborKey === targetKey) {
+        return firstStepByKey.get(neighborKey) ?? null;
+      }
+
+      queue.push(neighbor);
+    }
+  }
+
+  return null;
+}
+
+function getPathDistance(ship, target, occupiedCells, lookup) {
+  const startKey = getCellKey(getX(ship), getY(ship));
+  const targetKey = getCellKey(target.x, target.y);
+
+  if (startKey === targetKey) {
+    return 0;
+  }
+
+  const queue = [{ x: getX(ship), y: getY(ship), distance: 0 }];
+  const visited = new Set([startKey]);
+
+  while (queue.length > 0) {
+    const current = queue.shift();
+
+    for (const neighbor of buildSearchNeighbors(current, target)) {
+      const neighborKey = getCellKey(neighbor.x, neighbor.y);
+
+      if (visited.has(neighborKey)) {
+        continue;
+      }
+
+      if (isOccupiedCell(neighbor.x, neighbor.y, occupiedCells)) {
+        continue;
+      }
+
+      if (!isPassableCoord(neighbor.x, neighbor.y, lookup)) {
+        continue;
+      }
+
+      if (neighborKey === targetKey) {
+        return current.distance + 1;
+      }
+
+      visited.add(neighborKey);
+      queue.push({ ...neighbor, distance: current.distance + 1 });
+    }
+  }
+
+  return Number.POSITIVE_INFINITY;
+}
+
+function getSlotBlockingScore(slot, ships, target, ignoredShipId = null) {
+  if (!Array.isArray(ships) || ships.length === 0) {
+    return 0;
+  }
+
+  let directPressure = 0;
+  let nearbyPressure = 0;
+
+  for (const otherShip of ships) {
+    if (!otherShip || otherShip.id === ignoredShipId || isAdjacent(otherShip, target)) {
+      continue;
+    }
+
+    const preferredStep = nextStepToward(otherShip, target);
+
+    if (getCellKey(preferredStep.x, preferredStep.y) === getCellKey(slot.x, slot.y)) {
+      directPressure += 1;
+    }
+
+    const distance = chebyshevDistance(otherShip, slot);
+
+    if (distance <= 2) {
+      nearbyPressure += 3 - distance;
+    }
+  }
+
+  return directPressure * 100 + nearbyPressure;
+}
+
+function chooseRangeAdjustmentCell(ship, target, ships, occupiedCells, lookup) {
+  if (!isAdjacent(ship, target)) {
+    return null;
+  }
+
+  const currentScore = getSlotBlockingScore(ship, ships, target, ship.id);
+
+  if (currentScore <= 0) {
+    return null;
+  }
+
+  const candidates = buildAdjacentCells(target).filter(
+    (cell) =>
+      chebyshevDistance(ship, cell) === 1 &&
+      getCellKey(cell.x, cell.y) !== getCellKey(getX(ship), getY(ship)) &&
+      !isOccupiedCell(cell.x, cell.y, occupiedCells) &&
+      isPassableCoord(cell.x, cell.y, lookup)
+  );
+
+  if (candidates.length === 0) {
+    return null;
+  }
+
+  candidates.sort((left, right) => {
+    const leftScore = getSlotBlockingScore(left, ships, target, ship.id);
+    const rightScore = getSlotBlockingScore(right, ships, target, ship.id);
+
+    if (leftScore !== rightScore) {
+      return leftScore - rightScore;
+    }
+
+    return left.x - right.x || left.y - right.y;
+  });
+
+  const bestCandidate = candidates[0];
+  return getSlotBlockingScore(bestCandidate, ships, target, ship.id) < currentScore
+    ? bestCandidate
+    : null;
+}
+
+function pickStagingCell(ship, target, occupiedCells, lookup, ships = []) {
   const candidates = buildAdjacentCells(target).filter(
     (cell) =>
       !isOccupiedCell(cell.x, cell.y, occupiedCells) &&
@@ -158,6 +333,20 @@ function pickStagingCell(ship, target, occupiedCells, lookup) {
   }
 
   candidates.sort((left, right) => {
+    const leftBlockingScore = getSlotBlockingScore(left, ships, target, ship.id);
+    const rightBlockingScore = getSlotBlockingScore(right, ships, target, ship.id);
+
+    if (leftBlockingScore !== rightBlockingScore) {
+      return leftBlockingScore - rightBlockingScore;
+    }
+
+    const leftPathDistance = getPathDistance(ship, left, occupiedCells, lookup);
+    const rightPathDistance = getPathDistance(ship, right, occupiedCells, lookup);
+
+    if (leftPathDistance !== rightPathDistance) {
+      return leftPathDistance - rightPathDistance;
+    }
+
     const leftScore = chebyshevDistance(ship, left);
     const rightScore = chebyshevDistance(ship, right);
     return leftScore - rightScore;
@@ -167,6 +356,12 @@ function pickStagingCell(ship, target, occupiedCells, lookup) {
 }
 
 function chooseNextStep(ship, target, occupiedCells, lookup) {
+  const pathStep = findPathStep(ship, target, occupiedCells, lookup);
+
+  if (pathStep) {
+    return pathStep;
+  }
+
   const preferred = nextStepToward(ship, target);
 
   if (
@@ -291,6 +486,11 @@ function targetOwnedByTeam(team, cell) {
   );
 }
 
+function isAsteroidPlanet(cell) {
+  const planetType = String(cell?.planete?.typePlanete ?? "").toUpperCase();
+  return planetType.includes("ASTERO");
+}
+
 function printUsage() {
   console.log("Usage:");
   console.log('npm.cmd run siege -- 11 47 "HyperCESIssable"');
@@ -322,6 +522,8 @@ async function main() {
   printStatus("Ctrl + C pour arreter.");
 
   while (true) {
+    const cycleStartedAt = Date.now();
+
     try {
       const [allShips, team] = await Promise.all([getShips(), getTeamState()]);
       const attackShips =
@@ -341,7 +543,51 @@ async function main() {
       const targetCell = cellLookup.get(getCellKey(targetX, targetY));
 
       if (!targetCell?.planete) {
-        throw new Error("Planete cible introuvable dans la vision actuelle.");
+        printStatus(
+          `Cible (${targetX}, ${targetY}) hors vision actuelle, approche sur coordonnees.`
+        );
+
+        const occupiedCells = new Set(
+          allShips.map((ship) => getCellKey(getX(ship), getY(ship)))
+        );
+        let actionDone = false;
+
+        for (const ship of attackShips.sort((left, right) => left.nom.localeCompare(right.nom))) {
+          const readyDelay = getShipReadyDelay(ship);
+
+          if (readyDelay > 0) {
+            printStatus(`${ship.nom} attend encore ${Math.ceil(readyDelay / 1000)}s`);
+            continue;
+          }
+
+          occupiedCells.delete(getCellKey(getX(ship), getY(ship)));
+          const moveTarget = chooseNextStep(ship, target, occupiedCells, cellLookup);
+
+          if (!moveTarget) {
+            continue;
+          }
+
+          reserveCell(occupiedCells, moveTarget);
+          printStatus(`${ship.nom} avance vers la zone: move (${moveTarget.x}, ${moveTarget.y})`);
+          await sendShipAction(ship.id, "DEPLACEMENT", moveTarget.x, moveTarget.y);
+          actionDone = true;
+          break;
+        }
+
+        await sleep(
+          getCycleSleepDelay(
+            cycleStartedAt,
+            actionDone ? intervalMs : Math.max(intervalMs, 3000)
+          )
+        );
+        continue;
+      }
+
+      if (isAsteroidPlanet(targetCell)) {
+        printStatus(
+          `${targetCell.planete.nom} (${targetX}, ${targetY}) est un champ d'asteroides, non capturable. Siege arrete.`
+        );
+        return;
       }
 
       if (targetOwnedByTeam(team, targetCell)) {
@@ -380,11 +626,17 @@ async function main() {
         if (isAdjacent(claimShip, target)) {
           printStatus(`${claimShip.nom} tente CONQUERIR sur (${targetX}, ${targetY})`);
           await sendShipAction(claimShip.id, "CONQUERIR", targetX, targetY);
-          await sleep(intervalMs);
+          await sleep(getCycleSleepDelay(cycleStartedAt, intervalMs));
           continue;
         }
 
-        const claimStage = pickStagingCell(claimShip, target, occupiedCells, cellLookup);
+        const claimStage = pickStagingCell(
+          claimShip,
+          target,
+          occupiedCells,
+          cellLookup,
+          attackShips
+        );
 
         if (!claimStage) {
           throw new Error("Aucune case libre pour approcher la conquete.");
@@ -401,7 +653,7 @@ async function main() {
           `${claimShip.nom} se positionne pour conquerir: move (${moveTarget.x}, ${moveTarget.y})`
         );
         await sendShipAction(claimShip.id, "DEPLACEMENT", moveTarget.x, moveTarget.y);
-        await sleep(intervalMs);
+        await sleep(getCycleSleepDelay(cycleStartedAt, intervalMs));
         continue;
       }
 
@@ -418,13 +670,31 @@ async function main() {
         occupiedCells.delete(getCellKey(getX(ship), getY(ship)));
 
         if (isAdjacent(ship, target)) {
+          const sidestepCell = chooseRangeAdjustmentCell(
+            ship,
+            target,
+            attackShips,
+            occupiedCells,
+            cellLookup
+          );
+
+          if (sidestepCell) {
+            reserveCell(occupiedCells, sidestepCell);
+            printStatus(
+              `${ship.nom} se decale pour liberer l'approche: move (${sidestepCell.x}, ${sidestepCell.y})`
+            );
+            await sendShipAction(ship.id, "DEPLACEMENT", sidestepCell.x, sidestepCell.y);
+            actionDone = true;
+            break;
+          }
+
           printStatus(`${ship.nom} attaque (${targetX}, ${targetY})`);
           await sendShipAction(ship.id, "ATTAQUER", targetX, targetY);
           actionDone = true;
           break;
         }
 
-        const stage = pickStagingCell(ship, target, occupiedCells, cellLookup);
+        const stage = pickStagingCell(ship, target, occupiedCells, cellLookup, attackShips);
 
         if (!stage) {
           throw new Error("Aucune case libre autour de la cible.");
@@ -443,7 +713,12 @@ async function main() {
         break;
       }
 
-      await sleep(actionDone ? intervalMs : Math.max(intervalMs, 3000));
+      await sleep(
+        getCycleSleepDelay(
+          cycleStartedAt,
+          actionDone ? intervalMs : Math.max(intervalMs, 3000)
+        )
+      );
     } catch (error) {
       if (!isRecoverableError(error)) {
         throw error;

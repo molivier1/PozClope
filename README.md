@@ -10,26 +10,15 @@ Permet de faire tourner le leaderboard
 
 Instance 2 → npm.cmd run dev
 
-
 ### Afficher nos vaisseaux
 
-npm.cmd run game -- team        
+npm.cmd run game -- team
 
 npm.cmd run game -- ships
 
 ### Infos market
 
 npm.cmd run getmodel -- --json
-
-
-
-
-
-
-
-
-
-
 
 ## Lancement
 
@@ -78,6 +67,7 @@ KEYCLOAK_PASSWORD=...
 ```
 
 Notes :
+
 - `TOKEN` doit rester sur une seule ligne.
 - `.env` peut etre a la racine ou dans `Backend/.env`.
 - si `TOKEN` expire, le script tente de passer par Keycloak si les variables sont presentes.
@@ -242,6 +232,7 @@ npm.cmd run farm-cargos
 ```
 
 Note :
+
 - un verrou empeche maintenant de lancer deux `farm-cargos` en parallele.
 
 ### Siege automatique
@@ -253,6 +244,7 @@ npm.cmd run siege:auto -- "chasseur 4" "Chasseur 5" "Chasseur M 1" "Chasseur M 3
 ```
 
 Comportement :
+
 - explore si aucune cible ennemie n'est visible,
 - attaque les planetes ennemies visibles,
 - tente `CONQUERIR` quand la planete arrive a `0 PV`,
@@ -287,6 +279,7 @@ SOCKET_LOG_FILE=logs/socket-events.ndjson
 ```
 
 Comportement :
+
 - reconnexion automatique,
 - log permanent dans un fichier NDJSON,
 - alerte sonore simple si un message contient un mot cle defini dans `SOCKET_ALERT_MATCH`,
@@ -301,11 +294,13 @@ Token expire :
 ```
 
 Causes probables :
+
 - `TOKEN` expire,
 - Keycloak inaccessible,
 - variables Keycloak absentes ou incorrectes.
 
 Si `farm-cargos` semble envoyer des ordres contradictoires :
+
 - verifier qu'un seul terminal execute `npm.cmd run farm-cargos`,
 - arreter les anciens scripts avec `Ctrl + C`,
 - relancer une seule fois le script.

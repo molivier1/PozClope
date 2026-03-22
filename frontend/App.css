@@ -149,7 +149,6 @@ input {
 }
 
 .planet-object.ghost {
-  pointer-events: none;
   opacity: 0.42;
 }
 

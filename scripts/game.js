@@ -99,6 +99,20 @@ async function apiPut(pathname, body) {
   return handleResponse(response, { method: "PUT", pathname, body });
 }
 
+async function apiPatch(pathname, body) {
+  const response = await fetch(`${API_URL}${pathname}`, {
+    method: "PATCH",
+    headers: {
+      Authorization: `Bearer ${await getAccessToken()}`,
+      Accept: "application/json",
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(body)
+  });
+
+  return handleResponse(response, { method: "PATCH", pathname, body });
+}
+
 async function handleResponse(response, context) {
   const rawText = await response.text();
   const data = parseJson(rawText);
@@ -556,6 +570,132 @@ async function placeModule(moduleId, planetId) {
   });
 }
 
+async function renameShip(shipId, shipName) {
+  const candidates = [
+    {
+      method: "PUT",
+      pathname: `/equipes/${TEAM_ID}/vaisseaux/${shipId}`,
+      body: { nom: shipName }
+    },
+    {
+      method: "PATCH",
+      pathname: `/equipes/${TEAM_ID}/vaisseaux/${shipId}`,
+      body: { nom: shipName }
+    },
+    {
+      method: "POST",
+      pathname: `/equipes/${TEAM_ID}/vaisseaux/${shipId}`,
+      body: { nom: shipName }
+    },
+    {
+      method: "PUT",
+      pathname: `/equipes/${TEAM_ID}/vaisseau/${shipId}`,
+      body: { nom: shipName }
+    },
+    {
+      method: "PATCH",
+      pathname: `/equipes/${TEAM_ID}/vaisseau/${shipId}`,
+      body: { nom: shipName }
+    },
+    {
+      method: "PUT",
+      pathname: `/equipes/${TEAM_ID}/vaisseaux/${shipId}/renommer`,
+      body: { nom: shipName }
+    },
+    {
+      method: "POST",
+      pathname: `/equipes/${TEAM_ID}/vaisseaux/${shipId}/renommer`,
+      body: { nom: shipName }
+    },
+    {
+      method: "PATCH",
+      pathname: `/equipes/${TEAM_ID}/vaisseaux/${shipId}/renommer`,
+      body: { nom: shipName }
+    },
+    {
+      method: "PUT",
+      pathname: `/equipes/${TEAM_ID}/vaisseau/${shipId}/renommer`,
+      body: { nom: shipName }
+    },
+    {
+      method: "POST",
+      pathname: `/equipes/${TEAM_ID}/vaisseau/${shipId}/renommer`,
+      body: { nom: shipName }
+    },
+    {
+      method: "PATCH",
+      pathname: `/equipes/${TEAM_ID}/vaisseau/${shipId}/renommer`,
+      body: { nom: shipName }
+    },
+    {
+      method: "PUT",
+      pathname: `/equipes/${TEAM_ID}/vaisseaux/${shipId}`,
+      body: { idVaisseau: shipId, nom: shipName }
+    },
+    {
+      method: "PATCH",
+      pathname: `/equipes/${TEAM_ID}/vaisseaux/${shipId}`,
+      body: { idVaisseau: shipId, nom: shipName }
+    },
+    {
+      method: "PUT",
+      pathname: `/equipes/${TEAM_ID}/vaisseaux/${shipId}/nom`,
+      body: { nom: shipName }
+    },
+    {
+      method: "PATCH",
+      pathname: `/equipes/${TEAM_ID}/vaisseaux/${shipId}/nom`,
+      body: { nom: shipName }
+    },
+    {
+      method: "POST",
+      pathname: `/equipes/${TEAM_ID}/vaisseaux/${shipId}/nom`,
+      body: { nom: shipName }
+    },
+    {
+      method: "PUT",
+      pathname: `/equipes/${TEAM_ID}/vaisseaux/${shipId}`,
+      body: { name: shipName }
+    },
+    {
+      method: "PATCH",
+      pathname: `/equipes/${TEAM_ID}/vaisseaux/${shipId}`,
+      body: { name: shipName }
+    },
+    {
+      method: "PUT",
+      pathname: `/equipes/${TEAM_ID}/vaisseaux/${shipId}`,
+      body: { nouveauNom: shipName }
+    },
+    {
+      method: "PATCH",
+      pathname: `/equipes/${TEAM_ID}/vaisseaux/${shipId}`,
+      body: { nouveauNom: shipName }
+    }
+  ];
+  const errors = [];
+
+  for (const candidate of candidates) {
+    try {
+      if (candidate.method === "PUT") {
+        return await apiPut(candidate.pathname, candidate.body);
+      }
+
+      if (candidate.method === "PATCH") {
+        return await apiPatch(candidate.pathname, candidate.body);
+      }
+
+      return await apiPost(candidate.pathname, candidate.body);
+    } catch (error) {
+      errors.push(`${candidate.method} ${candidate.pathname} -> ${error.message}`);
+    }
+  }
+
+  throw new Error(
+    `Aucun endpoint de renommage compatible trouve.\n${errors.join("\n")}`
+  );
+}
+
 function findCheapestModuleOffer(offers, typeModule) {
   return extractArray(offers)
     .map((offer) => ({
@@ -674,6 +814,7 @@ function printUsage() {
   console.log('npm.cmd run game -- build-cargo "Cargo 1"');
   console.log('npm.cmd run game -- build-fighter "Chasseur 2"');
   console.log('npm.cmd run game -- build-cargo-medium "Cargo M 1"');
+  console.log('npm.cmd run game -- rename-ship "Ancien Nom" "Nouveau Nom"');
   console.log('npm.cmd run game -- move "Chasseur leger 0" 6 40');
   console.log('npm.cmd run game -- harvest "Chasseur leger 0" 6 40');
   console.log('npm.cmd run game -- deposit "Chasseur leger 0" 5 44');
@@ -825,23 +966,125 @@ function normalizeText(value) {
     .toLowerCase();
 }
 
-function getActiveShipNameSet(teamPayload) {
-  const names = extractArray(teamPayload?.vaisseaux)
-    .map((ship) => ship?.nom)
-    .filter(Boolean)
-    .map((name) => normalizeText(name));
+function getRawShipId(ship) {
+  const value =
+    ship?.identifiant ??
+    ship?.idVaisseau ??
+    ship?.id ??
+    null;
 
-  return new Set(names);
+  return value === null || value === undefined ? null : String(value);
+}
+
+function normalizeCooldownValue(value) {
+  return value === null || value === undefined ? "" : String(value);
+}
+
+function isOriginGhostShip(ship) {
+  return Number(ship?.coord_x ?? ship?.x ?? 0) === 0 && Number(ship?.coord_y ?? ship?.y ?? 0) === 0;
+}
+
+function getActiveShipData(teamPayload) {
+  const ids = new Set();
+  const names = new Map();
+
+  for (const ship of extractArray(teamPayload?.vaisseaux)) {
+    const id = getRawShipId(ship);
+    const name = ship?.nom;
+
+    if (id) {
+      ids.add(id);
+    }
+
+    if (name) {
+      const key = normalizeText(name);
+      const entries = names.get(key) ?? [];
+      entries.push({
+        cooldown: normalizeCooldownValue(ship?.dateProchaineAction ?? ship?.cooldown),
+        minerai: Number(ship?.mineraiTransporte ?? ship?.minerai ?? 0),
+        pointDeVie: Number(ship?.pointDeVie ?? 0)
+      });
+      names.set(key, entries);
+    }
+  }
+
+  return { ids, names };
+}
+
+function scoreShipCandidate(ship, referenceEntries) {
+  const cooldown = normalizeCooldownValue(ship?.cooldown ?? ship?.dateProchaineAction);
+  const minerai = Number(ship?.minerai ?? ship?.mineraiTransporte ?? 0);
+  const pointDeVie = Number(ship?.pointDeVie ?? 0);
+
+  let score = 0;
+
+  if (!isOriginGhostShip(ship)) {
+    score += 1000;
+  }
+
+  if (referenceEntries.some((entry) => entry.cooldown && entry.cooldown === cooldown)) {
+    score += 100;
+  }
+
+  if (referenceEntries.some((entry) => entry.minerai === minerai)) {
+    score += 10;
+  }
+
+  if (pointDeVie > 0 && referenceEntries.some((entry) => entry.pointDeVie === pointDeVie)) {
+    score += 5;
+  }
+
+  return score;
 }
 
 function filterActiveShips(ships, teamPayload) {
-  const activeNames = getActiveShipNameSet(teamPayload);
+  const { ids: activeIds, names: activeNames } = getActiveShipData(teamPayload);
 
-  if (activeNames.size === 0) {
+  if (activeIds.size === 0 && activeNames.size === 0) {
     return ships;
   }
 
-  return ships.filter((ship) => activeNames.has(normalizeText(ship.nom)));
+  const byName = new Map();
+
+  for (const ship of ships) {
+    const shipId = getRawShipId(ship);
+    const shipNameKey = normalizeText(ship.nom);
+
+    if (shipId && activeIds.size > 0) {
+      if (activeIds.has(shipId)) {
+        const bucket = byName.get(shipNameKey) ?? [];
+        bucket.push(ship);
+        byName.set(shipNameKey, bucket);
+        continue;
+      }
+    }
+
+    if (activeNames.has(shipNameKey)) {
+      const bucket = byName.get(shipNameKey) ?? [];
+      bucket.push(ship);
+      byName.set(shipNameKey, bucket);
+    }
+  }
+
+  const filtered = [];
+
+  for (const [nameKey, referenceEntries] of activeNames.entries()) {
+    const candidates = byName.get(nameKey) ?? [];
+
+    candidates.sort((left, right) => {
+      const scoreGap = scoreShipCandidate(right, referenceEntries) - scoreShipCandidate(left, referenceEntries);
+
+      if (scoreGap !== 0) {
+        return scoreGap;
+      }
+
+      return normalizeCooldownValue(right.cooldown).localeCompare(normalizeCooldownValue(left.cooldown));
+    });
+
+    filtered.push(...candidates.slice(0, referenceEntries.length));
+  }
+
+  return filtered;
 }
 
 async function findShipByName(name) {
@@ -951,6 +1194,21 @@ async function run() {
         );
       }
     }
+    return;
+  }
+
+  if (command === "rename-ship") {
+    const oldName = shipName;
+    const newName = [x, y].filter(Boolean).join(" ").trim();
+
+    if (!oldName || !newName) {
+      fail('Il faut fournir l’ancien et le nouveau nom. Exemple: rename-ship "Cargo L 1" "Cargo L Alpha"');
+    }
+
+    const ship = await findShipByName(oldName);
+    console.log(`Renommage de ${ship.nom} -> ${newName}`);
+    const result = await renameShip(ship.id, newName);
+    console.log(JSON.stringify(result, null, 2));
     return;
   }
 

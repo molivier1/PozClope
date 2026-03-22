@@ -11,7 +11,7 @@ const {
 } = require("./game");
 
 const MAP_SIZE = 58;
-const LOCK_FILE = path.join(__dirname, ".siege-plus.lock");
+const LOCK_FILE = path.join(__dirname, ".siege-friendly.lock");
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -62,11 +62,11 @@ function acquireLock() {
 
       if (current?.pid && current.pid !== process.pid && isProcessAlive(current.pid)) {
         throw new Error(
-          `siege:auto est deja lance (PID ${current.pid}). Arrete l'autre terminal avant de relancer.`
+          `siege:friendly est deja lance (PID ${current.pid}). Arrete l'autre terminal avant de relancer.`
         );
       }
     } catch (error) {
-      if (error?.message?.includes("siege:auto est deja lance")) {
+      if (error?.message?.includes("siege:friendly est deja lance")) {
         throw error;
       }
     }
@@ -146,8 +146,6 @@ async function getVisibleCellsForShips(ships, radius = 8) {
   const queryRadius = Math.min(radius, 6);
 
   for (const ship of ships) {
-    // The live API starts dropping planet payloads on wider map windows.
-    // Keep target discovery on smaller, reliable scans around each ship.
     const range = buildLocalRange(ship, queryRadius);
     const cells = await getMap(range.xMin, range.xMax, range.yMin, range.yMax);
 
@@ -681,7 +679,7 @@ function getRetryDelay(error, intervalMs) {
 }
 
 function isOccupiedTargetError(error) {
-  return String(error?.message ?? "").includes("Case cible déjà occupée");
+  return String(error?.message ?? "").includes("Case cible dÃ©jÃ  occupÃ©e");
 }
 
 function isNeutralConquerError(error) {
@@ -721,6 +719,15 @@ function isRecoverableError(error) {
   );
 }
 
+function hasMeaningfulOwner(cell) {
+  return Boolean(cell?.proprietaire?.identifiant || cell?.proprietaire?.nom);
+}
+
+function isAsteroidPlanet(cell) {
+  const planetType = String(cell?.planete?.typePlanete ?? "").toUpperCase();
+  return planetType.includes("ASTERO");
+}
+
 function targetOwnedByTeam(team, cell) {
   if (!cell?.planete) {
     return false;
@@ -731,21 +738,12 @@ function targetOwnedByTeam(team, cell) {
   );
 }
 
-function hasMeaningfulOwner(cell) {
-  return Boolean(cell?.proprietaire?.identifiant || cell?.proprietaire?.nom);
-}
-
-function isAsteroidPlanet(cell) {
-  const planetType = String(cell?.planete?.typePlanete ?? "").toUpperCase();
-  return planetType.includes("ASTERO");
-}
-
 function isCombatShip(ship) {
   const shipClass = String(ship?.classe ?? ship?.classeVaisseau ?? "");
   return ["CHASSEUR", "CROISEUR", "AMIRAL"].some((prefix) => shipClass.includes(prefix));
 }
 
-function isNonOwnedPlanet(team, cell) {
+function isNeutralTarget(team, cell) {
   if (!cell?.planete || cell.planete.estVide) {
     return false;
   }
@@ -762,25 +760,7 @@ function isNonOwnedPlanet(team, cell) {
     return false;
   }
 
-  return true;
-}
-
-function isEnemyOwnedTarget(team, cell) {
-  return isNonOwnedPlanet(team, cell) && hasMeaningfulOwner(cell);
-}
-
-function isSiegeableTarget(team, cell, options = {}) {
-  const includeNeutral = options.includeNeutral === true;
-
-  if (!isNonOwnedPlanet(team, cell)) {
-    return false;
-  }
-
-  if (!includeNeutral && !isEnemyOwnedTarget(team, cell)) {
-    return false;
-  }
-
-  return true;
+  return !hasMeaningfulOwner(cell);
 }
 
 function getClosestShipDistance(ships, cell) {
@@ -790,8 +770,12 @@ function getClosestShipDistance(ships, cell) {
   }, Number.POSITIVE_INFINITY);
 }
 
-function chooseNearestTarget(cells, attackShips, team, options = {}) {
-  const targets = cells.filter((cell) => isSiegeableTarget(team, cell, options));
+function chooseNearestNeutralTarget(cells, attackShips, team, blockedTargets) {
+  const targets = cells.filter(
+    (cell) =>
+      isNeutralTarget(team, cell) &&
+      !blockedTargets.has(getCellKey(cell.coord_x, cell.coord_y))
+  );
 
   if (targets.length === 0) {
     return null;
@@ -803,13 +787,6 @@ function chooseNearestTarget(cells, attackShips, team, options = {}) {
 
     if (distanceGap !== 0) {
       return distanceGap;
-    }
-
-    const rightEnemy = Number(hasMeaningfulOwner(right));
-    const leftEnemy = Number(hasMeaningfulOwner(left));
-
-    if (rightEnemy !== leftEnemy) {
-      return rightEnemy - leftEnemy;
     }
 
     const hitPointsGap =
@@ -858,11 +835,12 @@ function getTargetLabel(cell) {
 
 function printUsage() {
   console.log("Usage:");
-  console.log("npm.cmd run siege:auto");
-  console.log('npm.cmd run siege:auto -- "Chasseur 3" "Chasseur M 1"');
+  console.log("npm.cmd run siege:friendly");
+  console.log('npm.cmd run siege:friendly -- "Chasseur M 1" "Chasseur M 2"');
   console.log("Optionnel:");
   console.log("  SIEGE_INTERVAL_MS=5000");
   console.log("  SIEGE_TARGET_HP=0");
+  console.log("  SIEGE_SCAN_RADIUS=8");
 }
 
 async function main() {
@@ -873,7 +851,6 @@ async function main() {
   const intervalMs = parseNumber(process.env.SIEGE_INTERVAL_MS, 5000);
   const targetHp = parseNumber(process.env.SIEGE_TARGET_HP, 0);
   const scanRadius = Math.max(4, Math.min(parseNumber(process.env.SIEGE_SCAN_RADIUS, 8), 12));
-  const includeNeutralTargets = process.env.SIEGE_INCLUDE_NEUTRAL === "1";
 
   let currentTargetKey = null;
   let lastTargetLogKey = null;
@@ -885,7 +862,7 @@ async function main() {
   let lastAllWaitingLogAt = 0;
 
   printStatus(
-    `Siege++ lance | cible auto la plus proche visible | seuil conquete ${targetHp} PV`
+    `Siege friendly lance | planetes neutres uniquement | seuil conquete ${targetHp} PV`
   );
   printStatus("Ctrl + C pour arreter.");
 
@@ -918,19 +895,13 @@ async function main() {
       const cells = await getVisibleCellsForShips(attackShips, scanRadius);
       const cellLookup = buildCellLookup(cells);
       let targetCell = currentTargetKey ? cellLookup.get(currentTargetKey) ?? null : null;
-      const targetOptions = { includeNeutral: includeNeutralTargets };
 
       if (targetCell && blockedTargets.has(getCellKey(targetCell.coord_x, targetCell.coord_y))) {
         targetCell = null;
       }
 
-      if (!targetCell || !isSiegeableTarget(team, targetCell, targetOptions)) {
-        targetCell = chooseNearestTarget(
-          cells.filter((cell) => !blockedTargets.has(getCellKey(cell.coord_x, cell.coord_y))),
-          attackShips,
-          team,
-          targetOptions
-        );
+      if (!targetCell || !isNeutralTarget(team, targetCell)) {
+        targetCell = chooseNearestNeutralTarget(cells, attackShips, team, blockedTargets);
         currentTargetKey = targetCell ? getCellKey(targetCell.coord_x, targetCell.coord_y) : null;
       }
 
@@ -968,12 +939,7 @@ async function main() {
           }
 
           if (!waypoint) {
-            waypoint = chooseExplorationWaypoint(
-              ship,
-              attackShips,
-              scanRadius,
-              usedWaypointKeys
-            );
+            waypoint = chooseExplorationWaypoint(ship, attackShips, scanRadius, usedWaypointKeys);
           }
 
           if (!waypoint) {
@@ -1026,7 +992,7 @@ async function main() {
         if (explorationActions === 0) {
           if (shouldLogAgain(lastNoTargetLogAt, 15000)) {
             printStatus(
-              "Aucune planete ennemie ou conquerable visible pour le moment. Nouvelle tentative plus tard."
+              "Aucune planete neutre visible pour le moment. Nouvelle tentative plus tard."
             );
             lastNoTargetLogAt = Date.now();
           }
@@ -1043,7 +1009,7 @@ async function main() {
       explorationTargets.clear();
 
       if (lastTargetLogKey !== targetKey) {
-        printStatus(`Nouvelle cible: ${getTargetLabel(targetCell)}`);
+        printStatus(`Nouvelle cible neutre: ${getTargetLabel(targetCell)}`);
         lastTargetLogKey = targetKey;
       }
 
@@ -1067,7 +1033,7 @@ async function main() {
       }
 
       printStatus(
-        `Cible ${targetCell.planete.nom} | proprio ${targetCell.proprietaire?.nom ?? "aucun"} | PV ${targetCell.planete.pointDeVie}`
+        `Cible ${targetCell.planete.nom} | proprio aucun | PV ${targetCell.planete.pointDeVie}`
       );
 
       const hitPoints = Number(targetCell.planete.pointDeVie ?? 0);
@@ -1106,9 +1072,9 @@ async function main() {
               throw error;
             }
 
-            blockedTargets.set(getCellKey(target.x, target.y), Date.now() + 10 * 60 * 1000);
+            blockedTargets.set(targetKey, Date.now() + 10 * 60 * 1000);
             printStatus(
-              `${getTargetLabel(targetCell)} ignoree temporairement: conquete impossible sur une planete neutre`
+              `${getTargetLabel(targetCell)} ignoree temporairement: conquete impossible sur cette planete neutre`
             );
             currentTargetKey = null;
             lastTargetLogKey = null;
