@@ -325,6 +325,83 @@ function getOwnerColor(ownerName, currentTeamName) {
   return TEAM_COLOR_PALETTE[hashLabel(ownerName) % TEAM_COLOR_PALETTE.length];
 }
 
+function extractPlanetModuleTypes(planetLike) {
+  return (planetLike?.modules ?? [])
+    .map((module) => module?.typeModule ?? module?.paramModule?.typeModule ?? module?.moduleType ?? null)
+    .filter(Boolean);
+}
+
+function hasPlanetModule(planetLike, moduleType) {
+  return extractPlanetModuleTypes(planetLike).includes(moduleType);
+}
+
+function isAsteroidPlanet(planetLike) {
+  return String(planetLike?.typePlanete ?? '').trim().toUpperCase() === 'CHAMPS_ASTEROIDES';
+}
+
+function isCapturablePlanet(planetLike, currentTeamName) {
+  if (!planetLike) {
+    return false;
+  }
+
+  if (isAsteroidPlanet(planetLike)) {
+    return false;
+  }
+
+  if (hasPlanetModule(planetLike, 'GOUVERNANCE_PLANETAIRE')) {
+    return false;
+  }
+
+  return !planetLike.owner || planetLike.owner !== currentTeamName;
+}
+
+function getPlanetBadges(planetLike, currentTeamName) {
+  const badges = [];
+
+  if (hasPlanetModule(planetLike, 'GOUVERNANCE_PLANETAIRE')) {
+    badges.push({ key: 'capital', label: 'Capitale', tone: 'danger' });
+  }
+
+  if (hasPlanetModule(planetLike, 'DECHARGEMENT_RESSOURCE')) {
+    badges.push({ key: 'deposit', label: 'Depot', tone: 'ally' });
+  }
+
+  if (
+    hasPlanetModule(planetLike, 'CONSTRUCTION_VAISSEAUX') ||
+    hasPlanetModule(planetLike, 'CONSTRUCTION_VAISSEAUX_AVANCEE')
+  ) {
+    badges.push({ key: 'shipyard', label: 'Chantier', tone: 'warn' });
+  }
+
+  if (isAsteroidPlanet(planetLike)) {
+    badges.push({ key: 'asteroid', label: 'Asteroides', tone: 'neutral' });
+  }
+
+  if (isCapturablePlanet(planetLike, currentTeamName)) {
+    badges.push({ key: 'capturable', label: 'Capturable', tone: 'accent' });
+  }
+
+  return badges;
+}
+
+function matchesPlanetFilter(planetLike, filterMode, currentTeamName) {
+  if (filterMode === 'capturable') {
+    return isCapturablePlanet(planetLike, currentTeamName);
+  }
+
+  if (filterMode === 'strategic') {
+    return getPlanetBadges(planetLike, currentTeamName).some((badge) =>
+      ['deposit', 'shipyard', 'capital'].includes(badge.key)
+    );
+  }
+
+  if (filterMode === 'owned') {
+    return Boolean(planetLike.owner && planetLike.owner === currentTeamName);
+  }
+
+  return true;
+}
+
 function getShipReadyDelayMs(ship) {
   if (!ship?.cooldown) {
     return 0;
@@ -456,6 +533,7 @@ function parseSnapshot(stateData, mapCells, ownerLookup = new Map()) {
         biome: cell.planete.biome ?? cell.planete.modelePlanete?.biome,
         typePlanete: cell.planete.typePlanete ?? cell.planete.modelePlanete?.typePlanete,
         owner: resolveOwnerName(cell.proprietaire, ownerLookup, null),
+        modules: extractPlanetModuleTypes(cell.planete),
         category: 'PLANET'
       });
     }
@@ -511,6 +589,7 @@ function parsePlanetCatalog(mapCells, ownerLookup = new Map()) {
       biome: cell.planete.biome ?? cell.planete.modelePlanete?.biome,
       typePlanete: cell.planete.typePlanete ?? cell.planete.modelePlanete?.typePlanete,
       owner: resolveOwnerName(cell.proprietaire, ownerLookup, null),
+      modules: extractPlanetModuleTypes(cell.planete),
       category: 'PLANET'
     });
   });
@@ -655,6 +734,7 @@ function App() {
   const [buildSelectionKey, setBuildSelectionKey] = useState('');
   const [buildShipName, setBuildShipName] = useState('');
   const [buildPending, setBuildPending] = useState(false);
+  const [planetFilter, setPlanetFilter] = useState('all');
   const [orderLog, setOrderLog] = useState([]);
   const [hasCentered, setHasCentered] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
@@ -1016,15 +1096,23 @@ function App() {
 
   const renderedPlanets = useMemo(
     () =>
-      planets.map((planet) => ({
-        ...planet,
-        cellKey: `${planet.x},${planet.y}`,
-        isVisible: visiblePlanetCells.has(`${planet.x},${planet.y}`),
-        isSelected: selected?.kind === 'planet' && selected.id === planet.id,
-        isOwned: Boolean(planet.owner && planet.owner === team?.nom),
-        ownerColor: getOwnerColor(planet.owner, team?.nom)
-      })),
-    [planets, selected, team?.nom, visiblePlanetCells]
+      planets
+        .map((planet) => {
+          const badges = getPlanetBadges(planet, team?.nom);
+
+          return {
+            ...planet,
+            cellKey: `${planet.x},${planet.y}`,
+            isVisible: visiblePlanetCells.has(`${planet.x},${planet.y}`),
+            isSelected: selected?.kind === 'planet' && selected.id === planet.id,
+            isOwned: Boolean(planet.owner && planet.owner === team?.nom),
+            isCapturable: isCapturablePlanet(planet, team?.nom),
+            badges,
+            ownerColor: getOwnerColor(planet.owner, team?.nom)
+          };
+        })
+        .filter((planet) => matchesPlanetFilter(planet, planetFilter, team?.nom)),
+    [planets, selected, team?.nom, visiblePlanetCells, planetFilter]
   );
 
   const renderedShips = useMemo(
@@ -1582,7 +1670,7 @@ function App() {
               <button
                 key={planet.id}
                 type="button"
-                className={`map-object planet-object interactive-object ghost ${planet.owner ? 'owned-planet' : ''} ${planet.isSelected ? 'selected-target' : ''}`}
+                className={`map-object planet-object interactive-object ghost ${planet.owner ? 'owned-planet' : ''} ${planet.isSelected ? 'selected-target' : ''} ${planet.isCapturable ? 'capturable-planet' : ''} ${planet.badges.some((badge) => ['deposit', 'shipyard'].includes(badge.key)) ? 'strategic-planet' : ''}`}
                 style={style}
                 onMouseDown={(event) => {
                   event.preventDefault();
@@ -1608,6 +1696,15 @@ function App() {
                     {shortShipLabel(planet.displayName)}
                   </span>
                 )}
+                {planet.badges.length > 0 && (
+                  <span className="planet-badge-stack ghost">
+                    {planet.badges.slice(0, 2).map((badge) => (
+                      <span key={badge.key} className={`planet-badge ${badge.tone}`}>
+                        {badge.label}
+                      </span>
+                    ))}
+                  </span>
+                )}
               </button>
             );
           }
@@ -1616,7 +1713,7 @@ function App() {
             <button
               key={planet.id}
               type="button"
-              className={`map-object planet-object interactive-object ${planet.isSelected ? 'selected-target' : ''} ${planet.isOwned ? 'owned-planet' : ''}`}
+              className={`map-object planet-object interactive-object ${planet.isSelected ? 'selected-target' : ''} ${planet.isOwned ? 'owned-planet' : ''} ${planet.isCapturable ? 'capturable-planet' : ''} ${planet.badges.some((badge) => ['deposit', 'shipyard'].includes(badge.key)) ? 'strategic-planet' : ''}`}
               style={style}
               onMouseDown={(event) => {
                 event.preventDefault();
@@ -1640,6 +1737,15 @@ function App() {
                   style={planet.owner ? { '--planet-owner-color': planet.ownerColor } : undefined}
                 >
                   {shortShipLabel(planet.displayName)}
+                </span>
+              )}
+              {planet.badges.length > 0 && (
+                <span className="planet-badge-stack">
+                  {planet.badges.slice(0, 2).map((badge) => (
+                    <span key={badge.key} className={`planet-badge ${badge.tone}`}>
+                      {badge.label}
+                    </span>
+                  ))}
                 </span>
               )}
             </button>
@@ -1786,6 +1892,13 @@ function App() {
           <button type="button" className="tiny-button" onClick={() => selectShipPreset('cargos')}>Cargos</button>
           <button type="button" className="tiny-button" onClick={() => selectShipPreset('all')}>Tous</button>
           <button type="button" className="tiny-button ghost" onClick={clearTacticalState}>Clear</button>
+        </div>
+
+        <div className="button-strip filter-strip">
+          <button type="button" className={`tiny-button ${planetFilter === 'all' ? 'active' : ''}`} onClick={() => setPlanetFilter('all')}>Toutes</button>
+          <button type="button" className={`tiny-button ${planetFilter === 'capturable' ? 'active' : ''}`} onClick={() => setPlanetFilter('capturable')}>Capturables</button>
+          <button type="button" className={`tiny-button ${planetFilter === 'strategic' ? 'active' : ''}`} onClick={() => setPlanetFilter('strategic')}>Strategiques</button>
+          <button type="button" className={`tiny-button ${planetFilter === 'owned' ? 'active' : ''}`} onClick={() => setPlanetFilter('owned')}>A nous</button>
         </div>
 
         <div className="roster-list">
@@ -2053,6 +2166,15 @@ function App() {
               <div className="mini-row">
                 <span>OWNER</span>
                 <span className="callout-value">{selected.owner}</span>
+              </div>
+            )}
+            {selected.kind === 'planet' && (
+              <div className="callout-badges">
+                {getPlanetBadges(selected, team?.nom).map((badge) => (
+                  <span key={badge.key} className={`planet-badge ${badge.tone}`}>
+                    {badge.label}
+                  </span>
+                ))}
               </div>
             )}
           </div>

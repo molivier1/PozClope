@@ -156,6 +156,22 @@ input {
   opacity: 0.74;
 }
 
+.planet-object.capturable-planet::before {
+  content: '';
+  position: absolute;
+  inset: 5px;
+  border-radius: 999px;
+  border: 1px dashed rgba(255, 179, 71, 0.72);
+  box-shadow: 0 0 14px rgba(255, 179, 71, 0.22);
+  pointer-events: none;
+}
+
+.planet-object.strategic-planet::after {
+  box-shadow:
+    0 0 20px rgba(111, 247, 255, 0.2),
+    inset 0 0 10px rgba(111, 247, 255, 0.14);
+}
+
 .planet-owner-ring.ghost {
   opacity: 0.72;
   box-shadow:
@@ -303,6 +319,65 @@ input {
 
 .planet-tag.ghost {
   opacity: 0.82;
+}
+
+.planet-badge-stack {
+  position: absolute;
+  top: -12px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: inline-flex;
+  gap: 4px;
+  max-width: 84px;
+  flex-wrap: wrap;
+  justify-content: center;
+  pointer-events: none;
+}
+
+.planet-badge-stack.ghost {
+  opacity: 0.88;
+}
+
+.planet-badge {
+  padding: 2px 5px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(5, 0, 8, 0.92);
+  font-size: 8px;
+  line-height: 1;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: #fff;
+}
+
+.planet-badge.accent {
+  border-color: rgba(255, 179, 71, 0.42);
+  background: rgba(255, 179, 71, 0.12);
+  color: #ffe2b8;
+}
+
+.planet-badge.ally {
+  border-color: rgba(111, 247, 255, 0.38);
+  background: rgba(111, 247, 255, 0.12);
+  color: #cfffff;
+}
+
+.planet-badge.warn {
+  border-color: rgba(255, 40, 255, 0.34);
+  background: rgba(255, 40, 255, 0.12);
+  color: #ffe1ff;
+}
+
+.planet-badge.danger {
+  border-color: rgba(255, 77, 116, 0.4);
+  background: rgba(255, 77, 116, 0.12);
+  color: #ffd2dc;
+}
+
+.planet-badge.neutral {
+  border-color: rgba(255, 255, 255, 0.18);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text-dim);
 }
 
 .ship-tag.friendly {
@@ -588,6 +663,10 @@ input {
   margin-bottom: 12px;
 }
 
+.filter-strip {
+  margin-top: -4px;
+}
+
 .tiny-button,
 .command-button,
 .roster-row {
@@ -722,6 +801,12 @@ input {
   background: rgba(111, 247, 255, 0.08);
 }
 
+.tiny-button.active {
+  border-color: rgba(111, 247, 255, 0.42);
+  background: rgba(111, 247, 255, 0.14);
+  color: #fff;
+}
+
 .command-button.active {
   border-color: rgba(111, 247, 255, 0.42);
   background: rgba(111, 247, 255, 0.14);
@@ -842,6 +927,13 @@ input {
 .callout-value {
   color: #fff;
   text-transform: uppercase;
+}
+
+.callout-badges {
+  margin-top: 10px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
 }
 
 .scanline {
