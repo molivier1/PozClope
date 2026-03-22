@@ -32,7 +32,8 @@ const SHIP_ACTIONS = new Set([
   "DEPOSER",
   "CONQUERIR",
   "ATTAQUER",
-  "REPARER"
+  "REPARER",
+  "FARM_ZONE"
 ]);
 
 for (const envPath of ENV_PATHS) {
@@ -311,6 +312,198 @@ function buildOccupiedCells(ships, ignoredShipId = null) {
   return occupied;
 }
 
+function isCargoShip(ship) {
+  return String(ship?.classeVaisseau ?? ship?.classe ?? "").includes("CARGO");
+}
+
+function getShipReadyDelayMs(ship) {
+  const cooldown = ship?.dateProchaineAction ?? ship?.cooldown ?? null;
+
+  if (!cooldown || cooldown === 0 || cooldown === "0") {
+    return 0;
+  }
+
+  if (typeof cooldown === "number" && Number.isFinite(cooldown)) {
+    return cooldown > 0 ? cooldown * 1000 : 0;
+  }
+
+  const parsed = new Date(cooldown);
+
+  if (!Number.isFinite(parsed.getTime())) {
+    return 0;
+  }
+
+  return Math.max(parsed.getTime() - Date.now(), 0);
+}
+
+function findTeamPlanetByCoords(team, x, y) {
+  return (
+    team?.planetes?.find(
+      (planet) => Number(planet.coord_x) === Number(x) && Number(planet.coord_y) === Number(y)
+    ) ?? null
+  );
+}
+
+function hasUnloadModule(planet) {
+  return extractArray(planet?.modules).some(
+    (module) => module.typeModule === "DECHARGEMENT_RESSOURCE"
+  );
+}
+
+function hasCapitalModule(planet) {
+  return extractArray(planet?.modules).some(
+    (module) => module.typeModule === "GOUVERNANCE_PLANETAIRE"
+  );
+}
+
+function isValidDepositHub(planet) {
+  return Boolean(planet) && hasUnloadModule(planet) && !hasCapitalModule(planet);
+}
+
+function chooseNearestDepositHub(ship, team) {
+  const hubs = extractArray(team?.planetes).filter((planet) => isValidDepositHub(planet));
+
+  if (!hubs.length) {
+    return null;
+  }
+
+  return hubs.sort(
+    (left, right) => chebyshevDistance(ship, left) - chebyshevDistance(ship, right)
+  )[0];
+}
+
+function getFarmZoneRadius(ship, override) {
+  if (Number.isFinite(override) && override > 0) {
+    return override;
+  }
+
+  const shipClass = String(ship?.classeVaisseau ?? ship?.classe ?? "");
+
+  if (shipClass === "CARGO_LEGER") {
+    return 6;
+  }
+
+  if (shipClass === "CARGO_MOYEN") {
+    return 8;
+  }
+
+  if (shipClass === "CARGO_LOURD") {
+    return 10;
+  }
+
+  return 8;
+}
+
+function scoreCargoMiningTarget(ship, hub, cell) {
+  const shipDistance = chebyshevDistance(ship, cell);
+  const hubDistance = chebyshevDistance(hub, cell);
+  const roundTripDistance = shipDistance + hubDistance;
+  const minerai = Number(cell.planete?.mineraiDisponible ?? 0);
+  const slots = Number(cell.planete?.slotsConstruction ?? 0);
+
+  return minerai - roundTripDistance * 260 - shipDistance * 180 + slots * 60;
+}
+
+function buildCargoMiningCandidates(team, cells, hub, ship, forcedRadius = NaN) {
+  const hubId = hub?.identifiant ?? null;
+  const maxMineRadius = getFarmZoneRadius(ship, forcedRadius);
+
+  return cells.filter((cell) => {
+    if (!cell.planete || cell.planete.estVide || Number(cell.planete.mineraiDisponible ?? 0) <= 0) {
+      return false;
+    }
+
+    if (cell.planete.identifiant && cell.planete.identifiant === hubId) {
+      return false;
+    }
+
+    if (
+      cell.proprietaire?.identifiant &&
+      String(cell.proprietaire.identifiant) !== String(team.identifiant)
+    ) {
+      return false;
+    }
+
+    if (Number.isFinite(maxMineRadius) && chebyshevDistance(hub, cell) > maxMineRadius) {
+      return false;
+    }
+
+    return true;
+  });
+}
+
+async function resolveFarmZoneAction(
+  ship,
+  team,
+  hub,
+  occupiedCells,
+  ships,
+  forcedRadius = NaN
+) {
+  if (!isCargoShip(ship)) {
+    return {
+      issuedAction: "FARM_ZONE",
+      coord_x: Number(hub.coord_x),
+      coord_y: Number(hub.coord_y),
+      completed: true,
+      skipped: true,
+      reason: "Ce mode est reserve aux cargos."
+    };
+  }
+
+  const cargo = Number(ship.mineraiTransporte ?? ship.minerai ?? 0);
+
+  if (cargo > 0) {
+    return resolveSmartShipAction(
+      ship,
+      "DEPOSER",
+      { x: Number(hub.coord_x), y: Number(hub.coord_y) },
+      occupiedCells,
+      ships
+    );
+  }
+
+  const mineRadius = getFarmZoneRadius(ship, forcedRadius);
+  const cells = await getMapCellsInRange(
+    clampRange([Number(hub.coord_x) - mineRadius, Number(hub.coord_x) + mineRadius]),
+    clampRange([Number(hub.coord_y) - mineRadius, Number(hub.coord_y) + mineRadius])
+  );
+
+  const candidates = buildCargoMiningCandidates(team, cells, hub, ship, forcedRadius).sort(
+    (left, right) => {
+      const scoreDelta =
+        scoreCargoMiningTarget(ship, hub, right) - scoreCargoMiningTarget(ship, hub, left);
+
+      if (scoreDelta !== 0) {
+        return scoreDelta;
+      }
+
+      return chebyshevDistance(ship, left) - chebyshevDistance(ship, right);
+    }
+  );
+
+  const mine = candidates[0];
+
+  if (!mine) {
+    return {
+      issuedAction: "FARM_ZONE",
+      coord_x: Number(hub.coord_x),
+      coord_y: Number(hub.coord_y),
+      completed: false,
+      skipped: true,
+      reason: "Aucune cible miniere visible dans cette zone."
+    };
+  }
+
+  return resolveSmartShipAction(
+    ship,
+    "RECOLTER",
+    { x: Number(mine.coord_x), y: Number(mine.coord_y) },
+    occupiedCells,
+    ships
+  );
+}
+
 async function getMapCellsInRange(xRange, yRange) {
   const isLargeRequest =
     xRange[1] - xRange[0] > 20 || yRange[1] - yRange[0] > 20;
@@ -333,7 +526,7 @@ async function getMapCellsInRange(xRange, yRange) {
 }
 
 async function resolveMoveActionTarget(ship, finalTarget, occupiedCells) {
-  const speed = Math.max(1, Number(ship.vitesse ?? 0));
+  const speed = getSafeMoveDistance();
   const target = {
     x: clamp(Number(finalTarget.x), 0, MAP_SIZE - 1),
     y: clamp(Number(finalTarget.y), 0, MAP_SIZE - 1)
@@ -441,8 +634,161 @@ function buildAdjacentCells(target) {
   );
 }
 
+function buildSearchNeighbors(origin, destination) {
+  return buildAdjacentCells(origin).sort((left, right) => {
+    const leftScore = chebyshevDistance(left, destination);
+    const rightScore = chebyshevDistance(right, destination);
+
+    if (leftScore !== rightScore) {
+      return leftScore - rightScore;
+    }
+
+    return left.x - right.x || left.y - right.y;
+  });
+}
+
+function isOccupiedCoord(x, y, occupiedCells) {
+  return occupiedCells.has(getCellKey(x, y));
+}
+
+function getPathDistance(start, target, occupiedCells, cellsByCoord) {
+  const startKey = getCellKey(start.x, start.y);
+  const targetKey = getCellKey(target.x, target.y);
+
+  if (startKey === targetKey) {
+    return 0;
+  }
+
+  const queue = [{ x: start.x, y: start.y, distance: 0 }];
+  const visited = new Set([startKey]);
+
+  while (queue.length > 0) {
+    const current = queue.shift();
+
+    for (const neighbor of buildSearchNeighbors(current, target)) {
+      const neighborKey = getCellKey(neighbor.x, neighbor.y);
+
+      if (visited.has(neighborKey)) {
+        continue;
+      }
+
+      if (isOccupiedCoord(neighbor.x, neighbor.y, occupiedCells)) {
+        continue;
+      }
+
+      if (!isPassableCell(cellsByCoord.get(neighborKey))) {
+        continue;
+      }
+
+      if (neighborKey === targetKey) {
+        return current.distance + 1;
+      }
+
+      visited.add(neighborKey);
+      queue.push({ ...neighbor, distance: current.distance + 1 });
+    }
+  }
+
+  return Number.POSITIVE_INFINITY;
+}
+
+function getSlotBlockingScore(slot, ships, target, ignoredShipId = null) {
+  if (!Array.isArray(ships) || ships.length === 0) {
+    return 0;
+  }
+
+  let directPressure = 0;
+  let nearbyPressure = 0;
+
+  for (const otherShip of ships) {
+    if (
+      !otherShip ||
+      String(otherShip.identifiant) === String(ignoredShipId) ||
+      chebyshevDistance(
+        { x: Number(otherShip.coord_x), y: Number(otherShip.coord_y) },
+        target
+      ) === 1
+    ) {
+      continue;
+    }
+
+    const preferredStep = {
+      x: Number(otherShip.coord_x) + Math.sign(target.x - Number(otherShip.coord_x)),
+      y: Number(otherShip.coord_y) + Math.sign(target.y - Number(otherShip.coord_y))
+    };
+
+    if (getCellKey(preferredStep.x, preferredStep.y) === getCellKey(slot.x, slot.y)) {
+      directPressure += 1;
+    }
+
+    const distance = chebyshevDistance(
+      { x: Number(otherShip.coord_x), y: Number(otherShip.coord_y) },
+      slot
+    );
+
+    if (distance <= 2) {
+      nearbyPressure += 3 - distance;
+    }
+  }
+
+  return directPressure * 100 + nearbyPressure;
+}
+
+function chooseRangeAdjustmentCell(ship, target, ships, occupiedCells, cellsByCoord) {
+  const current = {
+    x: Number(ship.coord_x),
+    y: Number(ship.coord_y)
+  };
+
+  if (chebyshevDistance(current, target) !== 1) {
+    return null;
+  }
+
+  const currentScore = getSlotBlockingScore(current, ships, target, ship.identifiant);
+
+  if (currentScore <= 0) {
+    return null;
+  }
+
+  const candidates = buildAdjacentCells(target).filter((cell) => {
+    if (chebyshevDistance(current, cell) !== 1) {
+      return false;
+    }
+
+    if (getCellKey(cell.x, cell.y) === getCellKey(current.x, current.y)) {
+      return false;
+    }
+
+    if (isOccupiedCoord(cell.x, cell.y, occupiedCells)) {
+      return false;
+    }
+
+    return isPassableCell(cellsByCoord.get(getCellKey(cell.x, cell.y)));
+  });
+
+  if (!candidates.length) {
+    return null;
+  }
+
+  candidates.sort((left, right) => {
+    const leftScore = getSlotBlockingScore(left, ships, target, ship.identifiant);
+    const rightScore = getSlotBlockingScore(right, ships, target, ship.identifiant);
+
+    if (leftScore !== rightScore) {
+      return leftScore - rightScore;
+    }
+
+    return left.x - right.x || left.y - right.y;
+  });
+
+  const bestCandidate = candidates[0];
+  return getSlotBlockingScore(bestCandidate, ships, target, ship.identifiant) < currentScore
+    ? bestCandidate
+    : null;
+}
+
 function chooseNextStepToward(ship, target, occupiedCells, cellsByCoord) {
-  const speed = Math.max(1, Number(ship.vitesse ?? 0));
+  const speed = getSafeMoveDistance();
   const current = {
     x: Number(ship.coord_x),
     y: Number(ship.coord_y)
@@ -476,6 +822,7 @@ function chooseNextStepToward(ship, target, occupiedCells, cellsByCoord) {
       candidates.push({
         x,
         y,
+        pathDistance: getPathDistance({ x, y }, target, occupiedCells, cellsByCoord),
         remainingDistance: chebyshevDistance({ x, y }, target),
         moveDistance: chebyshevDistance(current, { x, y })
       });
@@ -487,6 +834,10 @@ function chooseNextStepToward(ship, target, occupiedCells, cellsByCoord) {
   }
 
   candidates.sort((left, right) => {
+    if (left.pathDistance !== right.pathDistance) {
+      return left.pathDistance - right.pathDistance;
+    }
+
     if (left.remainingDistance !== right.remainingDistance) {
       return left.remainingDistance - right.remainingDistance;
     }
@@ -501,13 +852,13 @@ function chooseNextStepToward(ship, target, occupiedCells, cellsByCoord) {
   return candidates[0];
 }
 
-function pickAdjacentStage(ship, target, occupiedCells, cellsByCoord) {
+function pickAdjacentStage(ship, target, occupiedCells, cellsByCoord, ships = []) {
   const current = {
     x: Number(ship.coord_x),
     y: Number(ship.coord_y)
   };
   const candidates = buildAdjacentCells(target).filter((cell) => {
-    if (occupiedCells.has(getCellKey(cell.x, cell.y))) {
+    if (isOccupiedCoord(cell.x, cell.y, occupiedCells)) {
       return false;
     }
 
@@ -519,6 +870,20 @@ function pickAdjacentStage(ship, target, occupiedCells, cellsByCoord) {
   }
 
   candidates.sort((left, right) => {
+    const leftBlocking = getSlotBlockingScore(left, ships, target, ship.identifiant);
+    const rightBlocking = getSlotBlockingScore(right, ships, target, ship.identifiant);
+
+    if (leftBlocking !== rightBlocking) {
+      return leftBlocking - rightBlocking;
+    }
+
+    const leftPathDistance = getPathDistance(current, left, occupiedCells, cellsByCoord);
+    const rightPathDistance = getPathDistance(current, right, occupiedCells, cellsByCoord);
+
+    if (leftPathDistance !== rightPathDistance) {
+      return leftPathDistance - rightPathDistance;
+    }
+
     const leftDistance = chebyshevDistance(current, left);
     const rightDistance = chebyshevDistance(current, right);
     return leftDistance - rightDistance || left.x - right.x || left.y - right.y;
@@ -527,7 +892,13 @@ function pickAdjacentStage(ship, target, occupiedCells, cellsByCoord) {
   return candidates[0];
 }
 
-async function resolveSmartShipAction(ship, requestedAction, targetCoord, occupiedCells) {
+async function resolveSmartShipAction(
+  ship,
+  requestedAction,
+  targetCoord,
+  occupiedCells,
+  ships = []
+) {
   const current = {
     x: Number(ship.coord_x),
     y: Number(ship.coord_y)
@@ -550,8 +921,8 @@ async function resolveSmartShipAction(ship, requestedAction, targetCoord, occupi
     };
   }
 
-  const xRange = clampRange([Math.min(current.x, target.x) - 1, Math.max(current.x, target.x) + 1]);
-  const yRange = clampRange([Math.min(current.y, target.y) - 1, Math.max(current.y, target.y) + 1]);
+  const xRange = clampRange([Math.min(current.x, target.x) - 3, Math.max(current.x, target.x) + 3]);
+  const yRange = clampRange([Math.min(current.y, target.y) - 3, Math.max(current.y, target.y) + 3]);
   const cells = await getMapCellsInRange(xRange, yRange);
   const cellsByCoord = new Map(
     cells.map((cell) => [getCellKey(cell.coord_x, cell.coord_y), cell])
@@ -560,10 +931,31 @@ async function resolveSmartShipAction(ship, requestedAction, targetCoord, occupi
   const inRange = chebyshevDistance(current, target) === 1;
 
   if (inRange) {
+    if (requestedAction === "ATTAQUER" || requestedAction === "CONQUERIR") {
+      const adjustmentCell = chooseRangeAdjustmentCell(
+        ship,
+        target,
+        ships,
+        occupiedCells,
+        cellsByCoord
+      );
+
+      if (adjustmentCell) {
+        return {
+          issuedAction: "DEPLACEMENT",
+          coord_x: adjustmentCell.x,
+          coord_y: adjustmentCell.y,
+          completed: false
+        };
+      }
+    }
+
     if (requestedAction === "ATTAQUER") {
       const hasTargetPlanet = Boolean(targetCell?.planete && !targetCell.planete.estVide);
       const hasHostileShip = (targetCell?.vaisseaux ?? []).some(
-        (targetShip) => targetShip?.proprietaire?.identifiant !== TEAM_ID
+        (targetShip) =>
+          targetShip?.proprietaire?.identifiant &&
+          String(targetShip.proprietaire.identifiant) !== String(TEAM_ID)
       );
 
       if (!hasTargetPlanet && !hasHostileShip) {
@@ -586,8 +978,31 @@ async function resolveSmartShipAction(ship, requestedAction, targetCoord, occupi
     }
 
     if (requestedAction === "CONQUERIR") {
-      const targetHp = Number(targetCell?.planete?.pointDeVie ?? 0);
+      const targetPlanet = targetCell?.planete ?? null;
+      const targetHp = Number(targetPlanet?.pointDeVie ?? 0);
       const ownerId = targetCell?.proprietaire?.identifiant ?? null;
+
+      if (!targetPlanet || targetPlanet.estVide) {
+        return {
+          issuedAction: "CONQUERIR",
+          coord_x: target.x,
+          coord_y: target.y,
+          completed: true,
+          skipped: true,
+          reason: "Aucune planete capturable sur cette case."
+        };
+      }
+
+      if (isNonCapturablePlanet(targetPlanet)) {
+        return {
+          issuedAction: "CONQUERIR",
+          coord_x: target.x,
+          coord_y: target.y,
+          completed: true,
+          skipped: true,
+          reason: `${targetPlanet.nom ?? "Cette planete"} n'est pas capturable.`
+        };
+      }
 
       if (ownerId && String(ownerId) === String(TEAM_ID)) {
         return {
@@ -709,7 +1124,7 @@ async function resolveSmartShipAction(ship, requestedAction, targetCoord, occupi
     };
   }
 
-  const stage = pickAdjacentStage(ship, target, occupiedCells, cellsByCoord);
+  const stage = pickAdjacentStage(ship, target, occupiedCells, cellsByCoord, ships);
 
   if (!stage) {
     throw createHttpError(
@@ -1609,6 +2024,26 @@ function manhattanDistance(from, to) {
   return Math.abs(from.coord_x - to.coord_x) + Math.abs(from.coord_y - to.coord_y);
 }
 
+function isNonCapturablePlanet(planet) {
+  const type = String(planet?.typePlanete ?? "").trim().toUpperCase();
+  return type === "CHAMPS_ASTEROIDES" || type === "VIDE";
+}
+
+function getSafeMoveDistance() {
+  // The API regularly rejects longer moves as "Case hors portée" even when
+  // the exposed ship speed suggests they should work. Use one safe step.
+  return 1;
+}
+
+function isOutOfRangeActionError(error) {
+  const message = String(error?.message ?? "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+
+  return message.includes("hors portee");
+}
+
 function getFleetCenter(ships) {
   if (!ships.length) {
     return null;
@@ -1680,6 +2115,206 @@ function getAllConstructibleTypes(planets) {
   }
 
   return types;
+}
+
+function getConstructibleShipEntries(team) {
+  const entries = [];
+  const seenKeys = new Set();
+
+  for (const planet of extractArray(team?.planetes)) {
+    for (const module of extractArray(planet?.modules)) {
+      if (
+        module.typeModule !== "CONSTRUCTION_VAISSEAUX" &&
+        module.typeModule !== "CONSTRUCTION_VAISSEAUX_AVANCEE"
+      ) {
+        continue;
+      }
+
+      for (const type of extractArray(module.listeVaisseauxConstructible)) {
+        const shipClass = String(type.classeVaisseau ?? "").trim();
+        const planetId = String(planet.identifiant ?? "");
+        const key = `${planetId}:${shipClass}`;
+
+        if (!planetId || !shipClass || seenKeys.has(key)) {
+          continue;
+        }
+
+        seenKeys.add(key);
+        entries.push({
+          identifiant: type.identifiant ?? null,
+          nom: type.nom ?? shipClass,
+          classeVaisseau: shipClass,
+          coutConstruction: Number(type.coutConstruction ?? 0),
+          planeteIdentifiant: planet.identifiant,
+          planeteNom: planet.nom ?? "Planete inconnue",
+          planeteCoordX: planet.coord_x,
+          planeteCoordY: planet.coord_y,
+          moduleType: module.typeModule
+        });
+      }
+    }
+  }
+
+  return entries;
+}
+
+function extractOwnedPlansByClass(payload) {
+  const plans = [];
+  const seenKeys = new Set();
+
+  const visit = (value) => {
+    if (!value || typeof value !== "object") {
+      return;
+    }
+
+    if (Array.isArray(value)) {
+      value.forEach(visit);
+      return;
+    }
+
+    const planType =
+      value.typeVaisseau ??
+      value.planVaisseau?.typeVaisseau ??
+      value.planVaisseau ??
+      null;
+    const shipClass = String(
+      planType?.classeVaisseau ?? value.classeVaisseau ?? ""
+    ).trim();
+    const planId = value.id ?? value.identifiant ?? null;
+    const typeId = planType?.id ?? planType?.identifiant ?? null;
+
+    if (shipClass) {
+      const key = `${shipClass}:${typeId ?? ""}:${planId ?? ""}`;
+
+      if (!seenKeys.has(key)) {
+        seenKeys.add(key);
+        plans.push({
+          shipClass,
+          planId: planId ? String(planId) : null,
+          typeId: typeId ? String(typeId) : null,
+          typeName: planType?.nom ?? value.nom ?? shipClass
+        });
+      }
+    }
+
+    Object.values(value).forEach(visit);
+  };
+
+  visit(payload);
+  return plans;
+}
+
+function extractMarketShipTypes(offers) {
+  const byClass = new Map();
+
+  for (const offer of extractArray(offers)) {
+    const plan =
+      offer.planVaisseau ??
+      offer.plan ??
+      offer.objet?.planVaisseau ??
+      offer.objet?.plan ??
+      null;
+    const type = plan?.typeVaisseau ?? null;
+
+    if (!type?.classeVaisseau || !type?.id) {
+      continue;
+    }
+
+    const current = byClass.get(type.classeVaisseau);
+    const nextCost = Number(type.coutConstruction ?? 0);
+    const currentCost = Number(current?.coutConstruction ?? Number.POSITIVE_INFINITY);
+
+    if (!current || nextCost < currentCost) {
+      byClass.set(type.classeVaisseau, {
+        identifiant: String(type.id),
+        nom: type.nom ?? type.classeVaisseau,
+        classeVaisseau: type.classeVaisseau,
+        coutConstruction: nextCost
+      });
+    }
+  }
+
+  return byClass;
+}
+
+function buildShipCandidates(constructibleEntry, plansPayload, marketOffers) {
+  const shipClass = constructibleEntry?.classeVaisseau ?? null;
+  const candidates = [];
+  const seenIds = new Set();
+  const pushCandidate = (typeId, source) => {
+    const normalizedTypeId = String(typeId ?? "").trim();
+
+    if (!normalizedTypeId || seenIds.has(normalizedTypeId)) {
+      return;
+    }
+
+    seenIds.add(normalizedTypeId);
+    candidates.push({
+      typeId: normalizedTypeId,
+      source
+    });
+  };
+
+  for (const plan of extractOwnedPlansByClass(plansPayload)) {
+    if (plan.shipClass !== shipClass) {
+      continue;
+    }
+
+    pushCandidate(plan.typeId, "plan.type");
+    pushCandidate(plan.planId, "plan");
+  }
+
+  pushCandidate(constructibleEntry?.identifiant, "constructible");
+
+  const marketType = extractMarketShipTypes(marketOffers).get(shipClass);
+  pushCandidate(marketType?.identifiant, "market");
+
+  return candidates;
+}
+
+async function tryBuildShip(shipName, constructibleEntry, plansPayload, marketOffers) {
+  const attempts = [];
+
+  for (const candidate of buildShipCandidates(
+    constructibleEntry,
+    plansPayload,
+    marketOffers
+  )) {
+    try {
+      const result = await apiRequest(`/equipes/${TEAM_ID}/vaisseau/construire`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          nom: shipName,
+          idTypeVaisseau: candidate.typeId,
+          idPlanete: constructibleEntry.planeteIdentifiant
+        })
+      });
+
+      return {
+        result,
+        source: candidate.source,
+        typeId: candidate.typeId,
+        attempts
+      };
+    } catch (error) {
+      attempts.push({
+        source: candidate.source,
+        typeId: candidate.typeId,
+        error: error.message
+      });
+    }
+  }
+
+  const details = attempts
+    .map((attempt) => `${attempt.source}:${attempt.typeId} -> ${attempt.error}`)
+    .join(" | ");
+  throw createHttpError(
+    `Impossible de construire ${constructibleEntry.classeVaisseau} sur ${constructibleEntry.planeteNom}. ${details || "Aucun id de construction resolu."}`,
+    400
+  );
 }
 
 function getShipRole(ship, context) {
@@ -2277,6 +2912,102 @@ app.get("/api/leaderboard", ensureConfig, async (req, res, next) => {
   }
 });
 
+app.get("/api/build/options", ensureConfig, async (req, res, next) => {
+  try {
+    const teamPayload = await apiGet(`/equipes/${TEAM_ID}`);
+    const team = normalizeTeam(teamPayload);
+    const credits = getResourceQuantity(team, "CREDIT");
+    const options = getConstructibleShipEntries(team)
+      .sort((left, right) => {
+        if (left.planeteNom !== right.planeteNom) {
+          return left.planeteNom.localeCompare(right.planeteNom, "fr");
+        }
+
+        return left.classeVaisseau.localeCompare(right.classeVaisseau, "fr");
+      })
+      .map((entry) => ({
+        shipClass: entry.classeVaisseau,
+        shipLabel: entry.nom ?? entry.classeVaisseau,
+        planetId: entry.planeteIdentifiant,
+        planetName: entry.planeteNom,
+        planetCoord: {
+          x: entry.planeteCoordX,
+          y: entry.planeteCoordY
+        },
+        cost: entry.coutConstruction,
+        affordable: credits >= entry.coutConstruction,
+        moduleType: entry.moduleType
+      }));
+
+    res.json({
+      fetchedAt: new Date().toISOString(),
+      credits,
+      options
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/build/ships", ensureConfig, async (req, res, next) => {
+  try {
+    const shipClass = String(req.body?.shipClass ?? "").trim().toUpperCase();
+    const planetId = String(req.body?.planetId ?? "").trim();
+    const shipName = String(req.body?.shipName ?? "").trim();
+
+    if (!shipClass) {
+      throw createHttpError("Classe de vaisseau manquante.", 400);
+    }
+
+    if (!planetId) {
+      throw createHttpError("Planete de construction manquante.", 400);
+    }
+
+    if (!shipName) {
+      throw createHttpError("Nom du vaisseau manquant.", 400);
+    }
+
+    const [teamPayload, plansPayload, marketOffers] = await Promise.all([
+      apiGet(`/equipes/${TEAM_ID}`),
+      apiGet(`/equipes/${TEAM_ID}/plans`).catch(() => []),
+      apiGet("/market/offres").catch(() => [])
+    ]);
+    const team = normalizeTeam(teamPayload);
+    const constructibleEntry = getConstructibleShipEntries(team).find(
+      (entry) =>
+        entry.classeVaisseau === shipClass &&
+        String(entry.planeteIdentifiant) === planetId
+    );
+
+    if (!constructibleEntry) {
+      throw createHttpError(
+        `${shipClass} n'est pas constructible sur cette planete.`,
+        404
+      );
+    }
+
+    const buildResult = await tryBuildShip(
+      shipName,
+      constructibleEntry,
+      plansPayload,
+      marketOffers
+    );
+
+    res.json({
+      shipClass,
+      shipName,
+      planetId,
+      planetName: constructibleEntry.planeteNom,
+      typeId: buildResult.typeId,
+      source: buildResult.source,
+      attempts: buildResult.attempts,
+      result: buildResult.result
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.post("/api/actions/ships", ensureConfig, async (req, res, next) => {
   try {
     const shipIds = [
@@ -2288,6 +3019,7 @@ app.post("/api/actions/ships", ensureConfig, async (req, res, next) => {
     const action = String(req.body?.action ?? "").toUpperCase();
     const coordX = Number(req.body?.coord_x);
     const coordY = Number(req.body?.coord_y);
+    const farmRadius = Number(req.body?.radius);
 
     if (!shipIds.length) {
       throw createHttpError("Aucun vaisseau selectionne.", 400);
@@ -2309,12 +3041,52 @@ app.post("/api/actions/ships", ensureConfig, async (req, res, next) => {
         .filter(Boolean),
       teamPayload
     );
+    const team = normalizeTeam(teamPayload);
     const shipsById = new Map(
       ships.map((ship) => [String(ship.identifiant), ship])
     );
     const uniqueShipIds = [...new Set(shipIds)];
     const results = [];
     const occupiedCells = buildOccupiedCells(ships);
+
+    let farmHub = null;
+    if (action === "FARM_ZONE") {
+      farmHub = findTeamPlanetByCoords(team, coordX, coordY);
+
+      if (!farmHub) {
+        throw createHttpError(
+          `Aucune planete a vous trouvee en [${coordX}:${coordY}].`,
+          404
+        );
+      }
+
+      if (
+        !farmHub.modules.some(
+          (module) => module.typeModule === "DECHARGEMENT_RESSOURCE"
+        )
+      ) {
+        throw createHttpError(
+          `${farmHub.nom} n'a pas de module de dechargement.`,
+          409
+        );
+      }
+    }
+
+    const issueShipAction = (shipId, issuedAction, issuedCoordX, issuedCoordY) =>
+      apiRequest(
+        `/equipes/${TEAM_ID}/vaisseaux/${encodeURIComponent(shipId)}/demander-action`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            action: issuedAction,
+            coord_x: issuedCoordX,
+            coord_y: issuedCoordY
+          })
+        }
+      );
 
     for (const shipId of uniqueShipIds) {
       const ship = shipsById.get(shipId);
@@ -2332,47 +3104,145 @@ app.post("/api/actions/ships", ensureConfig, async (req, res, next) => {
 
       try {
         occupiedCells.delete(getCellKey(ship.coord_x, ship.coord_y));
+        const requestedDepositHub =
+          action === "DEPOSER" ? findTeamPlanetByCoords(team, coordX, coordY) : null;
+        const resolvedDepositHub =
+          action === "DEPOSER"
+            ? isValidDepositHub(requestedDepositHub)
+              ? requestedDepositHub
+              : chooseNearestDepositHub(ship, team)
+            : null;
 
-        const resolvedAction = await resolveSmartShipAction(
-          ship,
-          action,
-          { x: coordX, y: coordY },
-          occupiedCells
-        );
-        const issuedCoordX = resolvedAction.coord_x;
-        const issuedCoordY = resolvedAction.coord_y;
-        const issuedAction = resolvedAction.issuedAction;
-        const skipped = Boolean(resolvedAction.skipped);
+        if (action === "DEPOSER" && !resolvedDepositHub) {
+          throw createHttpError(
+            "Aucun hub de depot valide trouve. Vise une de vos planetes avec DECHARGEMENT_RESSOURCE hors capitale.",
+            409
+          );
+        }
+        const effectiveTarget =
+          action === "DEPOSER" && resolvedDepositHub
+            ? { x: Number(resolvedDepositHub.coord_x), y: Number(resolvedDepositHub.coord_y) }
+            : { x: coordX, y: coordY };
 
-        const result = skipped
-          ? {
-              skipped: true,
-              reason: resolvedAction.reason ?? null
-            }
-          : await apiRequest(
-              `/equipes/${TEAM_ID}/vaisseaux/${encodeURIComponent(shipId)}/demander-action`,
-              {
-                method: "POST",
-                headers: {
-                  "Content-Type": "application/json"
-                },
-                body: JSON.stringify({
-                  action: issuedAction,
-                  coord_x: issuedCoordX,
-                  coord_y: issuedCoordY
-                })
-              }
+        let actingShip = ship;
+        let finalResolvedAction =
+          action === "FARM_ZONE"
+            ? await resolveFarmZoneAction(
+                ship,
+                team,
+                farmHub,
+                occupiedCells,
+                ships,
+                farmRadius
+              )
+            : await resolveSmartShipAction(
+                ship,
+                action,
+                effectiveTarget,
+                occupiedCells,
+                ships
+              );
+        let issuedCoordX = finalResolvedAction.coord_x;
+        let issuedCoordY = finalResolvedAction.coord_y;
+        let issuedAction = finalResolvedAction.issuedAction;
+        let skipped = Boolean(finalResolvedAction.skipped);
+        let result;
+
+        if (skipped) {
+          result = {
+            skipped: true,
+            reason: finalResolvedAction.reason ?? null
+          };
+        } else {
+          try {
+            result = await issueShipAction(
+              shipId,
+              issuedAction,
+              issuedCoordX,
+              issuedCoordY
             );
+          } catch (error) {
+            if (!isOutOfRangeActionError(error)) {
+              throw error;
+            }
+
+            const freshTeamPayload = await apiGet(`/equipes/${TEAM_ID}`);
+            const freshShipsPayload = await apiGet(`/equipes/${TEAM_ID}/vaisseaux`);
+            const freshShips = filterActiveShips(
+              extractArray(freshShipsPayload)
+                .map(normalizeShip)
+                .filter(Boolean),
+              freshTeamPayload
+            );
+            const freshTeam = normalizeTeam(freshTeamPayload);
+            const freshShip =
+              freshShips.find(
+                (entry) => String(entry.identifiant) === String(shipId)
+              ) ?? null;
+
+            if (!freshShip) {
+              throw error;
+            }
+
+            const refreshedOccupiedCells = buildOccupiedCells(freshShips);
+            refreshedOccupiedCells.delete(
+              getCellKey(freshShip.coord_x, freshShip.coord_y)
+            );
+            const refreshedFarmHub =
+              action === "FARM_ZONE"
+                ? findTeamPlanetByCoords(freshTeam, coordX, coordY) ?? farmHub
+                : null;
+
+            actingShip = freshShip;
+            finalResolvedAction =
+              action === "FARM_ZONE"
+                ? await resolveFarmZoneAction(
+                    freshShip,
+                    freshTeam,
+                    refreshedFarmHub,
+                    refreshedOccupiedCells,
+                    freshShips,
+                    farmRadius
+                  )
+                : await resolveSmartShipAction(
+                    freshShip,
+                    action,
+                    action === "DEPOSER" && resolvedDepositHub
+                      ? {
+                          x: Number(resolvedDepositHub.coord_x),
+                          y: Number(resolvedDepositHub.coord_y)
+                        }
+                      : { x: coordX, y: coordY },
+                    refreshedOccupiedCells,
+                    freshShips
+                  );
+            issuedCoordX = finalResolvedAction.coord_x;
+            issuedCoordY = finalResolvedAction.coord_y;
+            issuedAction = finalResolvedAction.issuedAction;
+            skipped = Boolean(finalResolvedAction.skipped);
+            result = skipped
+              ? {
+                  skipped: true,
+                  reason: finalResolvedAction.reason ?? null
+                }
+              : await issueShipAction(
+                  shipId,
+                  issuedAction,
+                  issuedCoordX,
+                  issuedCoordY
+                );
+          }
+        }
 
         occupiedCells.add(
           !skipped && issuedAction === "DEPLACEMENT"
             ? getCellKey(issuedCoordX, issuedCoordY)
-            : getCellKey(ship.coord_x, ship.coord_y)
+            : getCellKey(actingShip.coord_x, actingShip.coord_y)
         );
 
         results.push({
           shipId,
-          shipName: ship.nom,
+          shipName: actingShip.nom,
           ok: true,
           status: 200,
           result,
@@ -2381,14 +3251,14 @@ app.post("/api/actions/ships", ensureConfig, async (req, res, next) => {
             coord_y: issuedCoordY
           },
           requestedCoord: {
-            coord_x: coordX,
-            coord_y: coordY
+            coord_x: effectiveTarget.x,
+            coord_y: effectiveTarget.y
           },
           requestedAction: action,
           issuedAction,
           skipped,
-          reason: resolvedAction.reason ?? null,
-          completed: Boolean(resolvedAction.completed)
+          reason: finalResolvedAction.reason ?? null,
+          completed: Boolean(finalResolvedAction.completed)
         });
       } catch (error) {
         occupiedCells.add(getCellKey(ship.coord_x, ship.coord_y));

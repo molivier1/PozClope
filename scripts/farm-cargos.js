@@ -161,6 +161,14 @@ function getPreferredMineRadius(ship) {
   return 8;
 }
 
+function getForcedMineRadius(ship, forcedRadius) {
+  if (Number.isFinite(forcedRadius) && forcedRadius > 0) {
+    return forcedRadius;
+  }
+
+  return getPreferredMineRadius(ship);
+}
+
 function getWaitBucket(remainingMs) {
   const seconds = Math.ceil(Math.max(remainingMs, 0) / 1000);
 
@@ -381,6 +389,13 @@ function chooseNearestDepositHub(ship, team) {
   )[0];
 }
 
+function findTeamPlanetByCoords(team, x, y) {
+  return (
+    team.planetes.find((planet) => getX(planet) === Number(x) && getY(planet) === Number(y)) ??
+    null
+  );
+}
+
 function scoreMiningTarget(ship, hub, cell) {
   const shipDistance = chebyshevDistance(ship, cell);
   const hubDistance = chebyshevDistance(hub, cell);
@@ -391,9 +406,13 @@ function scoreMiningTarget(ship, hub, cell) {
   return minerai - roundTripDistance * 260 - shipDistance * 180 + slots * 60;
 }
 
-function buildMiningCandidates(team, cells, hub, ship = null) {
+function buildMiningCandidates(team, cells, hub, ship = null, options = {}) {
   const hubId = hub?.identifiant ?? null;
-  const maxMineRadius = ship ? getPreferredMineRadius(ship) : null;
+  const maxMineRadius = ship
+    ? getForcedMineRadius(ship, options.forcedRadius)
+    : Number.isFinite(options.forcedRadius) && options.forcedRadius > 0
+      ? options.forcedRadius
+      : null;
 
   return cells.filter((cell) => {
     if (!cell.planete || cell.planete.estVide || cell.planete.mineraiDisponible <= 0) {
@@ -466,16 +485,19 @@ function buildPlanFromMineCell(hub, mine) {
   };
 }
 
-function isVisibleMineStillValid(team, mineCell, hub) {
-  return buildMiningCandidates(team, [mineCell], hub).length > 0;
+function isVisibleMineStillValid(team, mineCell, hub, ship = null, options = {}) {
+  return buildMiningCandidates(team, [mineCell], hub, ship, options).length > 0;
 }
 
-function keepPreviousPlan(ship, team, cells, previousPlan) {
+function keepPreviousPlan(ship, team, cells, previousPlan, options = {}) {
   if (!previousPlan) {
     return null;
   }
 
-  const hub = findHubByPlan(team, previousPlan) ?? chooseNearestDepositHub(ship, team);
+  const hub =
+    options.forcedHub ??
+    findHubByPlan(team, previousPlan) ??
+    chooseNearestDepositHub(ship, team);
 
   if (!hub) {
     return null;
@@ -497,21 +519,33 @@ function keepPreviousPlan(ship, team, cells, previousPlan) {
     };
   }
 
-  if (!isVisibleMineStillValid(team, visibleMine, hub)) {
+  if (!isVisibleMineStillValid(team, visibleMine, hub, ship, options)) {
     return null;
   }
 
   return buildPlanFromMineCell(hub, visibleMine);
 }
 
-function assignTargetsToCargos(cargoShips, team, cells, previousAssignments = new Map()) {
+function assignTargetsToCargos(
+  cargoShips,
+  team,
+  cells,
+  previousAssignments = new Map(),
+  options = {}
+) {
   const assignments = new Map();
   const usedTargetKeys = new Set();
 
   const sortedShips = [...cargoShips].sort((left, right) => left.nom.localeCompare(right.nom));
 
   for (const ship of sortedShips) {
-    const previousPlan = keepPreviousPlan(ship, team, cells, previousAssignments.get(ship.id));
+    const previousPlan = keepPreviousPlan(
+      ship,
+      team,
+      cells,
+      previousAssignments.get(ship.id),
+      options
+    );
 
     if (!previousPlan) {
       continue;
@@ -532,13 +566,13 @@ function assignTargetsToCargos(cargoShips, team, cells, previousAssignments = ne
       continue;
     }
 
-    const hub = chooseNearestDepositHub(ship, team);
+    const hub = options.forcedHub ?? chooseNearestDepositHub(ship, team);
 
     if (!hub) {
       continue;
     }
 
-    let candidates = buildMiningCandidates(team, cells, hub, ship)
+    let candidates = buildMiningCandidates(team, cells, hub, ship, options)
       .filter((cell) => !usedTargetKeys.has(getCellKey(cell.coord_x, cell.coord_y)))
       .sort((left, right) => {
         const scoreDelta =
@@ -552,7 +586,7 @@ function assignTargetsToCargos(cargoShips, team, cells, previousAssignments = ne
       });
 
     if (candidates.length === 0) {
-      candidates = buildMiningCandidates(team, cells, hub)
+      candidates = buildMiningCandidates(team, cells, hub, null, options)
         .filter((cell) => !usedTargetKeys.has(getCellKey(cell.coord_x, cell.coord_y)))
         .sort((left, right) => {
           const scoreDelta =
@@ -577,6 +611,14 @@ function assignTargetsToCargos(cargoShips, team, cells, previousAssignments = ne
   }
 
   return assignments;
+}
+
+function printUsage() {
+  console.log("Usage:");
+  console.log("npm.cmd run farm-cargos");
+  console.log("npm.cmd run farm-cargos -- 7000");
+  console.log("npm.cmd run farm-cargos:zone -- 5 44 8");
+  console.log("npm.cmd run farm-cargos:zone -- 5 44 8 4000");
 }
 
 function getRetryDelay(error, intervalMs) {
@@ -697,7 +739,27 @@ async function main() {
   requireConfig();
   acquireLock();
 
-  const intervalMs = parseNumber(process.argv[2], 5000);
+  const rawArgs = process.argv.slice(2);
+  let intervalMs = 5000;
+  let forcedHubSelector = null;
+  let forcedRadius = NaN;
+
+  if (rawArgs[0] === "--zone") {
+    const hubX = parseNumber(rawArgs[1], NaN);
+    const hubY = parseNumber(rawArgs[2], NaN);
+    forcedRadius = parseNumber(rawArgs[3], NaN);
+    intervalMs = parseNumber(rawArgs[4], 5000);
+
+    if (!Number.isFinite(hubX) || !Number.isFinite(hubY)) {
+      printUsage();
+      throw new Error("En mode zone, il faut fournir x et y du depot.");
+    }
+
+    forcedHubSelector = { x: hubX, y: hubY };
+  } else {
+    intervalMs = parseNumber(rawArgs[0], 5000);
+  }
+
   const includeLightCargos = process.env.FARM_INCLUDE_LIGHT === "1";
   const assignmentLabels = new Map();
   const assignmentMemory = new Map();
@@ -705,6 +767,11 @@ async function main() {
   const waitLogBuckets = new Map();
 
   printStatus("Auto-farm cargos lance.");
+  if (forcedHubSelector) {
+    printStatus(
+      `Mode zone actif: depot force en (${forcedHubSelector.x}, ${forcedHubSelector.y})${Number.isFinite(forcedRadius) ? ` | rayon ${forcedRadius}` : ""}.`
+    );
+  }
   printStatus(
     includeLightCargos
       ? "Detection automatique de tous les CARGO_* de l'equipe. Ctrl + C pour arreter."
@@ -724,9 +791,31 @@ async function main() {
         );
       }
 
+      const forcedHub = forcedHubSelector
+        ? findTeamPlanetByCoords(team, forcedHubSelector.x, forcedHubSelector.y)
+        : null;
+
+      if (forcedHubSelector && !forcedHub) {
+        throw new Error(
+          `Aucune planete a vous trouvee en (${forcedHubSelector.x}, ${forcedHubSelector.y}).`
+        );
+      }
+
+      if (
+        forcedHub &&
+        !forcedHub.modules.some((module) => module.typeModule === "DECHARGEMENT_RESSOURCE")
+      ) {
+        throw new Error(
+          `${forcedHub.nom} (${getX(forcedHub)}, ${getY(forcedHub)}) n'a pas de module de dechargement.`
+        );
+      }
+
       const cells = await getVisibleCellsForShips(cargoShips, 6);
       const cellLookup = buildCellLookup(cells);
-      const assignments = assignTargetsToCargos(cargoShips, team, cells, assignmentMemory);
+      const assignments = assignTargetsToCargos(cargoShips, team, cells, assignmentMemory, {
+        forcedHub,
+        forcedRadius
+      });
       const occupiedCells = new Set(
         ships.map((ship) => getCellKey(getX(ship), getY(ship)))
       );

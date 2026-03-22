@@ -433,6 +433,8 @@ input {
   bottom: 20px;
   width: min(470px, calc(100vw - 40px));
   max-height: 52vh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .hud-bottom-right {
@@ -440,6 +442,22 @@ input {
   bottom: 20px;
   width: min(320px, calc(100vw - 40px));
   max-height: 34vh;
+}
+
+.hud-bottom-left::-webkit-scrollbar,
+.hud-bottom-right::-webkit-scrollbar {
+  width: 8px;
+}
+
+.hud-bottom-left::-webkit-scrollbar-thumb,
+.hud-bottom-right::-webkit-scrollbar-thumb {
+  background: rgba(255, 40, 255, 0.28);
+  border-radius: 999px;
+}
+
+.hud-bottom-left::-webkit-scrollbar-track,
+.hud-bottom-right::-webkit-scrollbar-track {
+  background: rgba(255, 255, 255, 0.03);
 }
 
 .panel-title {
@@ -702,6 +720,49 @@ input {
 .command-button.neutral {
   border-color: rgba(111, 247, 255, 0.2);
   background: rgba(111, 247, 255, 0.08);
+}
+
+.command-button.active {
+  border-color: rgba(111, 247, 255, 0.42);
+  background: rgba(111, 247, 255, 0.14);
+}
+
+.build-panel {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid rgba(255, 40, 255, 0.14);
+  display: grid;
+  gap: 10px;
+}
+
+.build-field {
+  display: grid;
+  gap: 6px;
+  font-size: 10px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+}
+
+.build-input {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid rgba(255, 40, 255, 0.22);
+  background: rgba(0, 0, 0, 0.22);
+  color: #fff;
+}
+
+.build-option-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-size: 10px;
+  color: var(--text-dim);
+}
+
+.build-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
 }
 
 .feedback-box {

@@ -737,18 +737,134 @@ function findOwnedPlanByClass(plans, shipClass) {
   }) ?? null;
 }
 
-function resolveBuildTypeIdFromPlans(plans, shipClass) {
-  const ownedPlan = findOwnedPlanByClass(plans, shipClass);
+function extractOwnedPlansByClass(payload) {
+  const plans = [];
+  const seenKeys = new Set();
 
-  if (!ownedPlan?.typeVaisseau?.id) {
-    return null;
+  const visit = (value) => {
+    if (!value) {
+      return;
+    }
+
+    if (Array.isArray(value)) {
+      value.forEach(visit);
+      return;
+    }
+
+    if (typeof value !== "object") {
+      return;
+    }
+
+    const planType =
+      value.typeVaisseau ??
+      value.planVaisseau?.typeVaisseau ??
+      value.planVaisseau ??
+      null;
+    const normalizedClass = String(
+      planType?.classeVaisseau ?? value.classeVaisseau ?? ""
+    ).trim();
+    const planId = value.id ?? value.identifiant ?? null;
+    const typeId = planType?.id ?? planType?.identifiant ?? null;
+
+    if (normalizedClass) {
+      const key = `${normalizedClass}:${typeId ?? ""}:${planId ?? ""}`;
+
+      if (!seenKeys.has(key)) {
+        seenKeys.add(key);
+        plans.push({
+          shipClass: normalizedClass,
+          planId: planId ? String(planId) : null,
+          typeId: typeId ? String(typeId) : null,
+          typeName: planType?.nom ?? value.nom ?? normalizedClass
+        });
+      }
+    }
+
+    Object.values(value).forEach(visit);
+  };
+
+  visit(payload);
+  return plans;
+}
+
+function buildShipCandidates(constructibleType, plans, marketOffers, shipClass) {
+  const candidates = [];
+  const seenIds = new Set();
+  const pushCandidate = (typeId, source) => {
+    const normalizedTypeId = String(typeId ?? "").trim();
+
+    if (!normalizedTypeId || seenIds.has(normalizedTypeId)) {
+      return;
+    }
+
+    seenIds.add(normalizedTypeId);
+    candidates.push({
+      typeId: normalizedTypeId,
+      source
+    });
+  };
+
+  for (const plan of extractOwnedPlansByClass(plans)) {
+    if (plan.shipClass !== shipClass) {
+      continue;
+    }
+
+    pushCandidate(plan.typeId, "plan.type");
+    pushCandidate(plan.planId, "plan");
   }
 
-  return {
-    typeId: ownedPlan.typeVaisseau.id,
-    typeName: ownedPlan.typeVaisseau.nom ?? shipClass,
-    shipClass: ownedPlan.typeVaisseau.classeVaisseau ?? shipClass
-  };
+  pushCandidate(constructibleType?.identifiant, "constructible");
+
+  const marketType = extractMarketShipTypes(marketOffers).get(shipClass);
+  pushCandidate(marketType?.identifiant, "market");
+
+  return candidates;
+}
+
+async function tryBuildShip(name, constructibleType, plans, marketOffers, shipClass) {
+  const attempts = [];
+  const candidates = buildShipCandidates(
+    constructibleType,
+    plans,
+    marketOffers,
+    shipClass
+  );
+
+  if (candidates.length === 0) {
+    throw new Error(
+      `Impossible de resoudre le type de construction pour ${shipClass}, alors qu'il est annonce constructible sur ${constructibleType.planeteNom}.`
+    );
+  }
+
+  for (const candidate of candidates) {
+    try {
+      const result = await buildShip(
+        name,
+        candidate.typeId,
+        constructibleType.planeteIdentifiant
+      );
+
+      return {
+        result,
+        source: candidate.source,
+        typeId: candidate.typeId,
+        attempts
+      };
+    } catch (error) {
+      attempts.push({
+        source: candidate.source,
+        typeId: candidate.typeId,
+        message: error.message
+      });
+    }
+  }
+
+  const attemptSummary = attempts
+    .map((attempt) => `${attempt.source}:${attempt.typeId} -> ${attempt.message}`)
+    .join(" | ");
+  throw new Error(
+    `Impossible de construire ${shipClass} sur ${constructibleType.planeteNom}. ${attemptSummary || "Aucun id valide."}`
+  );
 }
 
 function findBuildPlanet(team, acceptedModules) {
@@ -1279,29 +1395,36 @@ async function run() {
 
     const shipClass = String(shipName).toUpperCase();
     const customName = y ? [x, y].filter(Boolean).join(" ") : x;
-    const [team, plans] = await Promise.all([getTeamState(), getPlans()]);
+    const [team, plans, marketOffers] = await Promise.all([
+      getTeamState(),
+      getPlans().catch(() => []),
+      getMarketOffers().catch(() => [])
+    ]);
     const constructibleType = findConstructibleType(team, shipClass);
 
     if (!constructibleType) {
       fail(`Aucun ${shipClass} constructible trouve sur vos planetes.`);
     }
 
-    const buildType = resolveBuildTypeIdFromPlans(plans, shipClass);
-
-    if (!buildType?.typeId) {
-      fail(`Vous ne possedez pas de plan ${shipClass}.`);
-    }
-
     const shipNameToBuild = customName || `${shipClass}-${Date.now()}`;
-    console.log(
-      `Construction de ${shipNameToBuild} sur ${constructibleType.planeteNom} (${shipClass})`
-    );
-    const result = await buildShip(
+    const buildOutcome = await tryBuildShip(
       shipNameToBuild,
-      buildType.typeId,
-      constructibleType.planeteIdentifiant
+      constructibleType,
+      plans,
+      marketOffers,
+      shipClass
     );
-    console.log(JSON.stringify(result, null, 2));
+    console.log(
+      `Construction de ${shipNameToBuild} sur ${constructibleType.planeteNom} (${shipClass}, source ${buildOutcome.source}, type ${buildOutcome.typeId})`
+    );
+    if (buildOutcome.attempts.length > 0) {
+      for (const attempt of buildOutcome.attempts) {
+        console.log(
+          `  - tentative ${attempt.source} (${attempt.typeId}) -> ${attempt.message}`
+        );
+      }
+    }
+    console.log(JSON.stringify(buildOutcome.result, null, 2));
     return;
   }
 

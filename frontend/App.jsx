@@ -5,6 +5,7 @@ const FULL_MAP = 58;
 const BASE_CELL_SIZE = 50;
 const CLICKABLE_PLANET_SQUARE_SIZE = 18;
 const PLANET_RENDER_PADDING = 6;
+const ENEMY_SHIP_STALE_TTL_MS = 20_000;
 const DEMO_MODE_ENABLED = new URLSearchParams(window.location.search).get('demo') === '1';
 const TEAM_COLOR_PALETTE = [
   '#6ff7ff',
@@ -22,6 +23,7 @@ const ACTION_BUTTONS = [
   { action: 'DEPLACEMENT', label: 'Move', tone: 'neutral' },
   { action: 'ATTAQUER', label: 'Attack', tone: 'danger' },
   { action: 'CONQUERIR', label: 'Conquer', tone: 'accent' },
+  { action: 'FARM_ZONE', label: 'Farm cargos', tone: 'accent' },
   { action: 'RECOLTER', label: 'Harvest', tone: 'accent' },
   { action: 'DEPOSER', label: 'Deposit', tone: 'accent' },
   { action: 'REPARER', label: 'Repair', tone: 'neutral' }
@@ -208,6 +210,15 @@ function parseNumber(value, fallback = 0) {
   return Number.isFinite(numeric) ? numeric : fallback;
 }
 
+function formatShipClassLabel(shipClass) {
+  return String(shipClass ?? '')
+    .toLowerCase()
+    .split('_')
+    .filter(Boolean)
+    .map((chunk) => chunk.charAt(0).toUpperCase() + chunk.slice(1))
+    .join(' ');
+}
+
 function isOpaqueTeamIdentifier(value) {
   const text = String(value ?? '').trim();
 
@@ -275,6 +286,11 @@ function resolveOwnerName(ownerLike, ownerLookup, fallback = null) {
   }
 
   return fallback;
+}
+
+function isGenericEnemyOwner(ownerName) {
+  const normalized = String(ownerName ?? '').trim().toLowerCase();
+  return !normalized || ['ennemi', 'inconnu', 'hostile'].includes(normalized);
 }
 
 function shortShipLabel(name) {
@@ -460,7 +476,7 @@ function parseSnapshot(stateData, mapCells, ownerLookup = new Map()) {
         cargo: parseNumber(ship.mineraiTransporte),
         className: ship.classeVaisseau ?? 'ENEMY',
         isEnemy: true,
-        owner: resolveOwnerName(ship.proprietaire, ownerLookup, 'Ennemi')
+        owner: resolveOwnerName(ship.proprietaire, ownerLookup, null)
       });
     });
   });
@@ -519,7 +535,7 @@ function parseGlobalEnemyShips(payload, teamId, ownerLookup = new Map()) {
       capacity: parseNumber(ship.capaciteTransport),
       cooldown: ship.dateProchaineAction ?? null,
       isEnemy: true,
-      owner: resolveOwnerName(ship.proprietaire, ownerLookup, 'Ennemi')
+      owner: resolveOwnerName(ship.proprietaire, ownerLookup, null)
     }));
 }
 
@@ -533,16 +549,35 @@ function mergePlanets(previousPlanets, nextPlanets) {
   return [...byId.values()];
 }
 
-function mergeEnemyShips(previousEnemyShips, nextEnemyShips, range) {
-  const filteredPrevious = previousEnemyShips.filter(
-    (ship) =>
-      ship.x < range.x[0] ||
-      ship.x > range.x[1] ||
-      ship.y < range.y[0] ||
-      ship.y > range.y[1]
-  );
+function markEnemyShipsSeen(enemyShips, seenAt) {
+  return enemyShips.map((ship) => ({
+    ...ship,
+    lastSeenAt: seenAt
+  }));
+}
 
-  return [...filteredPrevious, ...nextEnemyShips];
+function mergeEnemyShips(
+  previousEnemyShips,
+  nextEnemyShips,
+  {
+    seenAt = Date.now(),
+    staleTtlMs = ENEMY_SHIP_STALE_TTL_MS
+  } = {}
+) {
+  const byId = new Map(previousEnemyShips.map((ship) => [ship.id, ship]));
+
+  nextEnemyShips.forEach((ship) => {
+    const previous = byId.get(ship.id);
+    const nextOwner = isGenericEnemyOwner(ship.owner) ? previous?.owner ?? null : ship.owner;
+    byId.set(ship.id, {
+      ...previous,
+      ...ship,
+      owner: nextOwner,
+      lastSeenAt: seenAt
+    });
+  });
+
+  return [...byId.values()].filter((ship) => seenAt - Number(ship.lastSeenAt ?? 0) <= staleTtlMs);
 }
 
 const ShipImage = ({ ship }) => {
@@ -614,6 +649,12 @@ function App() {
   const [actionFeedback, setActionFeedback] = useState(null);
   const [actionPending, setActionPending] = useState('');
   const [activeCommandPlan, setActiveCommandPlan] = useState(null);
+  const [buildPanelOpen, setBuildPanelOpen] = useState(false);
+  const [buildOptions, setBuildOptions] = useState([]);
+  const [buildOptionsPending, setBuildOptionsPending] = useState(false);
+  const [buildSelectionKey, setBuildSelectionKey] = useState('');
+  const [buildShipName, setBuildShipName] = useState('');
+  const [buildPending, setBuildPending] = useState(false);
   const [orderLog, setOrderLog] = useState([]);
   const [hasCentered, setHasCentered] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
@@ -623,6 +664,7 @@ function App() {
   const dragMovedRef = useRef(false);
   const suppressClickRef = useRef(false);
   const suppressClickTimeoutRef = useRef(null);
+  const autoCommandPendingRef = useRef(false);
   const liveContextRef = useRef({
     friendlyShips: [],
     selected: null,
@@ -736,9 +778,14 @@ function App() {
       ownerNameByIdRef.current = ownerLookup;
 
       const parsed = parseSnapshot(stateData, stateData.cells || [], ownerLookup);
+      const snapshotSeenAt = Date.now();
       const globalEnemyShips = enemyShipsPayload
-        ? parseGlobalEnemyShips(enemyShipsPayload, stateData.teamId, ownerLookup)
+        ? markEnemyShipsSeen(
+            parseGlobalEnemyShips(enemyShipsPayload, stateData.teamId, ownerLookup),
+            snapshotSeenAt
+          )
         : null;
+      const localEnemyShips = markEnemyShipsSeen(parsed.enemyShips, snapshotSeenAt);
       const globalPlanets = planetsPayload
         ? parsePlanetCatalog(planetsPayload.cells || [], ownerLookup)
         : null;
@@ -747,16 +794,18 @@ function App() {
       setTeam(stateData.team ?? null);
       setTeamId(stateData.teamId ?? null);
       setShips((previousShips) => {
-        const nextEnemyShips = globalEnemyShips ?? parsed.enemyShips;
+        const previousEnemyShips = previousShips.filter((ship) => ship.isEnemy);
+        const nextEnemyShips = globalEnemyShips
+          ? mergeEnemyShips(previousEnemyShips, globalEnemyShips, { seenAt: snapshotSeenAt })
+          : mergeEnemyShips(previousEnemyShips, localEnemyShips, { seenAt: snapshotSeenAt });
 
         if (mode === 'initial' || previousShips.length === 0) {
           return [...parsed.friendlyShips, ...nextEnemyShips];
         }
 
-        const previousEnemyShips = previousShips.filter((ship) => ship.isEnemy);
         return [
           ...parsed.friendlyShips,
-          ...(globalEnemyShips ?? mergeEnemyShips(previousEnemyShips, parsed.enemyShips, range))
+          ...nextEnemyShips
         ];
       });
       setPlanets((previousPlanets) =>
@@ -903,7 +952,7 @@ function App() {
   }, [selected]);
 
   useEffect(() => {
-    if (!activeCommandPlan || actionPending) {
+    if (!activeCommandPlan || actionPending || autoCommandPendingRef.current) {
       return undefined;
     }
 
@@ -938,7 +987,7 @@ function App() {
         silent: true,
         preserveCommandPlan: true
       });
-    }, 120);
+    }, activeCommandPlan.action === 'FARM_ZONE' ? 1800 : 120);
 
     return () => window.clearTimeout(timeoutId);
   }, [actionPending, activeCommandPlan, friendlyShipsById]);
@@ -1021,6 +1070,9 @@ function App() {
   const lastSyncLabel = lastSyncedAt
     ? new Date(lastSyncedAt).toLocaleTimeString('fr-FR')
     : '--:--:--';
+  const buildSelection = buildOptions.find((option) => (
+    `${option.shipClass}:${option.planetId}` === buildSelectionKey
+  )) ?? null;
 
   const appendLog = (label, tone = 'neutral') => {
     setOrderLog((previous) => [
@@ -1031,6 +1083,121 @@ function App() {
       },
       ...previous
     ].slice(0, 14));
+  };
+
+  const suggestShipName = (option) => {
+    if (!option) {
+      return '';
+    }
+
+    const siblingCount = ships.filter(
+      (ship) => !ship.isEnemy && ship.className === option.shipClass
+    ).length;
+    return `${formatShipClassLabel(option.shipClass)} ${siblingCount + 1}`;
+  };
+
+  const loadBuildOptions = async ({ openPanel = false } = {}) => {
+    try {
+      setBuildOptionsPending(true);
+      const response = await fetch('/api/build/options');
+      const payload = await response.json();
+
+      if (!response.ok) {
+        throw new Error(payload.error || `Erreur ${response.status}`);
+      }
+
+      const options = Array.isArray(payload.options) ? payload.options : [];
+      setBuildOptions(options);
+
+      if (openPanel) {
+        setBuildPanelOpen(true);
+      }
+
+      if (!options.length) {
+        setBuildSelectionKey('');
+        setBuildShipName('');
+        appendLog('Aucun vaisseau constructible pour le moment.', 'warn');
+        return;
+      }
+
+      const nextSelectionKey = options.some(
+        (option) => `${option.shipClass}:${option.planetId}` === buildSelectionKey
+      )
+        ? buildSelectionKey
+        : `${options[0].shipClass}:${options[0].planetId}`;
+      const nextSelection = options.find(
+        (option) => `${option.shipClass}:${option.planetId}` === nextSelectionKey
+      ) ?? options[0];
+
+      setBuildSelectionKey(nextSelectionKey);
+      setBuildShipName((current) => current || suggestShipName(nextSelection));
+    } catch (error) {
+      appendLog(`Build impossible: ${error.message}`, 'danger');
+    } finally {
+      setBuildOptionsPending(false);
+    }
+  };
+
+  const handleToggleBuildPanel = async () => {
+    if (buildPanelOpen) {
+      setBuildPanelOpen(false);
+      return;
+    }
+
+    await loadBuildOptions({ openPanel: true });
+  };
+
+  const handleBuildSelectionChange = (event) => {
+    const nextKey = event.target.value;
+    const nextSelection = buildOptions.find(
+      (option) => `${option.shipClass}:${option.planetId}` === nextKey
+    ) ?? null;
+
+    setBuildSelectionKey(nextKey);
+    setBuildShipName((current) => (
+      current && current.trim() ? current : suggestShipName(nextSelection)
+    ));
+  };
+
+  const handleBuildShip = async () => {
+    if (!buildSelection) {
+      appendLog('Aucun modele de construction selectionne.', 'danger');
+      return;
+    }
+
+    const shipName = buildShipName.trim() || suggestShipName(buildSelection);
+
+    try {
+      setBuildPending(true);
+      const response = await fetch('/api/build/ships', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          shipClass: buildSelection.shipClass,
+          planetId: buildSelection.planetId,
+          shipName
+        })
+      });
+      const payload = await response.json();
+
+      if (!response.ok) {
+        throw new Error(payload.error || `Erreur ${response.status}`);
+      }
+
+      appendLog(
+        `${shipName} construit sur ${payload.planetName} (${payload.shipClass})`,
+        'success'
+      );
+      setBuildShipName(suggestShipName(buildSelection));
+      await loadBuildOptions();
+      await fetchData({ mode: 'initial', forceLeaderboard: true });
+    } catch (error) {
+      appendLog(`Construction impossible: ${error.message}`, 'danger');
+    } finally {
+      setBuildPending(false);
+    }
   };
 
   const centerViewport = (x, y) => {
@@ -1077,6 +1244,7 @@ function App() {
     setSelected(null);
     setActionTarget({ x: '', y: '' });
     setActiveCommandPlan(null);
+    autoCommandPendingRef.current = false;
     setActionPending('');
     setActionFeedback(null);
     appendLog('Commande auto stoppee.', 'warn');
@@ -1109,6 +1277,23 @@ function App() {
       setActionTarget({
         x: String(ship.x),
         y: String(ship.y)
+      });
+      return;
+    }
+
+    const planetOnShipCell = planets.find(
+      (planet) => planet.x === ship.x && planet.y === ship.y
+    );
+
+    if (
+      planetOnShipCell &&
+      selected?.kind === 'ship' &&
+      selected.id === ship.id
+    ) {
+      setSelected(planetOnShipCell);
+      setActionTarget({
+        x: String(planetOnShipCell.x),
+        y: String(planetOnShipCell.y)
       });
       return;
     }
@@ -1246,7 +1431,11 @@ function App() {
     }
 
     try {
-      setActionPending(action);
+      if (silent) {
+        autoCommandPendingRef.current = true;
+      } else {
+        setActionPending(action);
+      }
       if (!silent) {
         setActionFeedback(null);
       }
@@ -1338,7 +1527,11 @@ function App() {
         appendLog(`${formatActionLabel(action)} impossible: ${error.message}`, 'danger');
       }
     } finally {
-      setActionPending('');
+      if (silent) {
+        autoCommandPendingRef.current = false;
+      } else {
+        setActionPending('');
+      }
     }
   };
 
@@ -1670,12 +1863,93 @@ function App() {
           ))}
           <button
             type="button"
+            className={`command-button accent ${buildPanelOpen ? 'active' : ''}`}
+            onClick={handleToggleBuildPanel}
+            disabled={Boolean(buildPending)}
+          >
+            {buildOptionsPending ? '...' : 'Build'}
+          </button>
+          <button
+            type="button"
             className="command-button neutral"
             onClick={() => fetchData({ mode: 'initial', forceLeaderboard: true })}
           >
             Refresh
           </button>
         </div>
+
+        {buildPanelOpen && (
+          <div className="build-panel">
+            <div className="mini-row">
+              <span>Construction</span>
+              <span className="value-neon">{team ? getResourceQuantity(team, 'CREDIT') : 0} CR</span>
+            </div>
+
+            {buildOptions.length === 0 ? (
+              <div className="empty-state">AUCUN MODELE CONSTRUCTIBLE.</div>
+            ) : (
+              <>
+                <label className="build-field">
+                  Modele
+                  <select
+                    className="build-input"
+                    value={buildSelectionKey}
+                    onChange={handleBuildSelectionChange}
+                    disabled={buildPending}
+                  >
+                    {buildOptions.map((option) => (
+                      <option
+                        key={`${option.shipClass}:${option.planetId}`}
+                        value={`${option.shipClass}:${option.planetId}`}
+                      >
+                        {`${formatShipClassLabel(option.shipClass)} · ${option.planetName} · ${option.cost} CR`}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+
+                {buildSelection && (
+                  <div className="build-option-meta">
+                    <span>{buildSelection.planetName}</span>
+                    <span>[{buildSelection.planetCoord?.x}:{buildSelection.planetCoord?.y}]</span>
+                    <span>{buildSelection.moduleType}</span>
+                  </div>
+                )}
+
+                <label className="build-field">
+                  Nom
+                  <input
+                    className="build-input"
+                    type="text"
+                    value={buildShipName}
+                    onChange={(event) => setBuildShipName(event.target.value)}
+                    placeholder={buildSelection ? suggestShipName(buildSelection) : 'Nom du vaisseau'}
+                    disabled={buildPending}
+                  />
+                </label>
+
+                <div className="build-actions">
+                  <button
+                    type="button"
+                    className="tiny-button ghost"
+                    onClick={() => loadBuildOptions()}
+                    disabled={buildPending || buildOptionsPending}
+                  >
+                    Reload
+                  </button>
+                  <button
+                    type="button"
+                    className="tiny-button"
+                    onClick={handleBuildShip}
+                    disabled={!buildSelection || buildPending}
+                  >
+                    {buildPending ? 'Construction...' : 'Construire'}
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        )}
 
         {actionFeedback && (
           <div className="feedback-box">

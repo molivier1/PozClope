@@ -12,10 +12,11 @@ const {
 } = require("./game");
 
 const MAP_SIZE = 58;
-const LOCK_FILE = path.join(__dirname, ".hunt-ship.lock");
+const LOCK_FILE = path.join(__dirname, ".battle-point.lock");
 const GET_ALL_SHIPS_MODULE_URL = pathToFileURL(
   path.join(__dirname, "..", "Backend", "getAllVaisseaux.js")
 ).href;
+const DEFAULT_ENEMY_REFRESH_MS = 15000;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -66,11 +67,11 @@ function acquireLock() {
 
       if (current?.pid && current.pid !== process.pid && isProcessAlive(current.pid)) {
         throw new Error(
-          `hunt est deja lance (PID ${current.pid}). Arrete l'autre terminal avant de relancer.`
+          `battle est deja lance (PID ${current.pid}). Arrete l'autre terminal avant de relancer.`
         );
       }
     } catch (error) {
-      if (error?.message?.includes("hunt est deja lance")) {
+      if (error?.message?.includes("battle est deja lance")) {
         throw error;
       }
     }
@@ -447,7 +448,14 @@ function pickStagingCell(attacker, target, occupiedCells, lookup, attackers = []
       return leftPathDistance - rightPathDistance;
     }
 
-    return chebyshevDistance(attacker, left) - chebyshevDistance(attacker, right);
+    const leftDistance = chebyshevDistance(attacker, left);
+    const rightDistance = chebyshevDistance(attacker, right);
+
+    if (leftDistance !== rightDistance) {
+      return leftDistance - rightDistance;
+    }
+
+    return left.x - right.x || left.y - right.y;
   });
 
   return candidates[0];
@@ -463,10 +471,6 @@ function chooseNextStep(ship, target, occupiedCells, lookup) {
   const preferred = nextStepToward(ship, target);
 
   if (
-    preferred.x >= 0 &&
-    preferred.x < MAP_SIZE &&
-    preferred.y >= 0 &&
-    preferred.y < MAP_SIZE &&
     !isOccupiedCell(preferred.x, preferred.y, occupiedCells) &&
     isPassableCoord(preferred.x, preferred.y, lookup)
   ) {
@@ -484,9 +488,21 @@ function chooseNextStep(ship, target, occupiedCells, lookup) {
   }
 
   alternatives.sort((left, right) => {
+    const leftPathDistance = getPathDistance(left, target, occupiedCells, lookup);
+    const rightPathDistance = getPathDistance(right, target, occupiedCells, lookup);
+
+    if (leftPathDistance !== rightPathDistance) {
+      return leftPathDistance - rightPathDistance;
+    }
+
     const leftScore = chebyshevDistance(left, target);
     const rightScore = chebyshevDistance(right, target);
-    return leftScore - rightScore;
+
+    if (leftScore !== rightScore) {
+      return leftScore - rightScore;
+    }
+
+    return left.x - right.x || left.y - right.y;
   });
 
   return alternatives[0];
@@ -569,9 +585,9 @@ function isRecoverableError(error) {
 function isOccupiedTargetError(error) {
   const message = String(error?.message ?? "");
   return (
-    message.includes("Case cible dÃ©jÃ  occupÃ©e") ||
+    message.includes("Case cible dÃƒÂ©jÃƒÂ  occupÃƒÂ©e") ||
     message.includes("Case cible deja occupee") ||
-    message.includes("Case cible dÃƒÂ©jÃƒÂ  occupÃƒÂ©e")
+    message.includes("Case cible dÃƒÆ’Ã‚Â©jÃƒÆ’Ã‚Â  occupÃƒÆ’Ã‚Â©e")
   );
 }
 
@@ -584,98 +600,45 @@ function buildAttackers(ships, attackerNames) {
   return ships.filter(isCombatShip);
 }
 
-function parseFocusArgs(args) {
-  if (args.length >= 2) {
-    const x = Number(args[0]);
-    const y = Number(args[1]);
+function findBestEnemyInZone(enemyShips, focusPoint, attackers, radius) {
+  const inZone = enemyShips.filter((ship) => chebyshevDistance(ship, focusPoint) <= radius);
 
-    if (Number.isFinite(x) && Number.isFinite(y)) {
-      return {
-        focusPoint: { x, y },
-        attackerNames: args.slice(2)
-      };
-    }
-  }
-
-  return {
-    focusPoint: null,
-    attackerNames: args
-  };
-}
-
-function isUuidLike(value) {
-  return /^[0-9a-f]{8}-[0-9a-f-]{4,}$/i.test(String(value));
-}
-
-function matchesTargetShip(ship, targetQuery) {
-  const rawId = String(ship?.idVaisseau ?? ship?.id ?? "");
-  const query = String(targetQuery ?? "").trim();
-  const normalizedQuery = normalizeShipName(query);
-
-  if (rawId && rawId === query) {
-    return 0;
-  }
-
-  if (rawId && query.length >= 6 && rawId.startsWith(query)) {
-    return 1;
-  }
-
-  const normalizedName = normalizeShipName(ship?.nom ?? "");
-
-  if (normalizedName === normalizedQuery) {
-    return 2;
-  }
-
-  if (!isUuidLike(query) && normalizedName.includes(normalizedQuery)) {
-    return 3;
-  }
-
-  return Number.POSITIVE_INFINITY;
-}
-
-function findTargetShip(enemyShips, targetQuery, attackers, focusPoint = null) {
-  const matches = enemyShips
-    .map((ship) => ({
-      ship,
-      rank: matchesTargetShip(ship, targetQuery)
-    }))
-    .filter((entry) => Number.isFinite(entry.rank));
-
-  if (matches.length === 0) {
+  if (inZone.length === 0) {
     return null;
   }
 
-  matches.sort((left, right) => {
-    if (left.rank !== right.rank) {
-      return left.rank - right.rank;
-    }
-
-    if (focusPoint) {
-      const leftFocusDistance = chebyshevDistance(left.ship, focusPoint);
-      const rightFocusDistance = chebyshevDistance(right.ship, focusPoint);
-
-      if (leftFocusDistance !== rightFocusDistance) {
-        return leftFocusDistance - rightFocusDistance;
-      }
-    }
-
-    const leftDistance = attackers.reduce(
-      (best, attacker) => Math.min(best, chebyshevDistance(attacker, left.ship)),
+  inZone.sort((left, right) => {
+    const leftAttackerDistance = attackers.reduce(
+      (best, attacker) => Math.min(best, chebyshevDistance(attacker, left)),
       Number.POSITIVE_INFINITY
     );
-    const rightDistance = attackers.reduce(
-      (best, attacker) => Math.min(best, chebyshevDistance(attacker, right.ship)),
+    const rightAttackerDistance = attackers.reduce(
+      (best, attacker) => Math.min(best, chebyshevDistance(attacker, right)),
       Number.POSITIVE_INFINITY
     );
 
-    if (leftDistance !== rightDistance) {
-      return leftDistance - rightDistance;
+    if (leftAttackerDistance !== rightAttackerDistance) {
+      return leftAttackerDistance - rightAttackerDistance;
     }
 
-    return String(left.ship.nom).localeCompare(String(right.ship.nom));
+    const leftFocusDistance = chebyshevDistance(left, focusPoint);
+    const rightFocusDistance = chebyshevDistance(right, focusPoint);
+
+    if (leftFocusDistance !== rightFocusDistance) {
+      return leftFocusDistance - rightFocusDistance;
+    }
+
+    const leftHp = Number(left.pointDeVie ?? Number.POSITIVE_INFINITY);
+    const rightHp = Number(right.pointDeVie ?? Number.POSITIVE_INFINITY);
+
+    if (leftHp !== rightHp) {
+      return leftHp - rightHp;
+    }
+
+    return String(left.nom).localeCompare(String(right.nom));
   });
 
-  return matches[0].ship;
+  return inZone[0];
 }
 
 async function getAllVaisseaux() {
@@ -683,48 +646,76 @@ async function getAllVaisseaux() {
   return loadAllShips();
 }
 
+let cachedEnemyShips = [];
+let cachedEnemyShipsFetchedAt = 0;
+let enemyShipsRefreshPromise = null;
+
+function startEnemyShipsRefresh(teamName) {
+  if (enemyShipsRefreshPromise) {
+    return enemyShipsRefreshPromise;
+  }
+
+  enemyShipsRefreshPromise = getAllVaisseaux()
+    .then((allShipsOnMap) => {
+      cachedEnemyShips = allShipsOnMap.filter(
+        (ship) => normalizeShipName(ship?.equipe ?? "") !== teamName
+      );
+      cachedEnemyShipsFetchedAt = Date.now();
+    })
+    .catch((error) => {
+      printStatus(`Scan ennemi differe: ${error.message}`);
+    })
+    .finally(() => {
+      enemyShipsRefreshPromise = null;
+    });
+
+  return enemyShipsRefreshPromise;
+}
+
+function refreshEnemyShipsIfNeeded(teamName, refreshMs) {
+  if (Date.now() - cachedEnemyShipsFetchedAt < refreshMs && cachedEnemyShips.length > 0) {
+    return;
+  }
+
+  void startEnemyShipsRefresh(teamName);
+}
+
 function printUsage() {
   console.log("Usage:");
-  console.log('npm.cmd run hunt -- "Nom Ennemi"');
-  console.log('npm.cmd run hunt -- "Nom Ennemi" 33 52');
-  console.log('npm.cmd run hunt -- "Nom Ennemi" "Chasseur M 1" "Chasseur M 2"');
-  console.log('npm.cmd run hunt -- "Nom Ennemi" 33 52 "Chasseur M 1" "Chasseur M 2"');
-  console.log('npm.cmd run hunt -- "29be59a1-c938-4d8f-8b25-2132e2281cd8" "Amiral 1"');
+  console.log('npm.cmd run battle -- 35 53');
+  console.log('npm.cmd run battle -- 35 53 "Amiral 1" "Amiral 2" "Amiral 3" "Amiral 4"');
   console.log("Optionnel:");
-  console.log("  HUNT_INTERVAL_MS=3000");
+  console.log("  BATTLE_INTERVAL_MS=3000");
+  console.log("  BATTLE_RADIUS=8");
 }
 
 async function main() {
   requireConfig();
   acquireLock();
 
-  const [targetQuery, ...rawArgs] = process.argv.slice(2);
-  const { focusPoint, attackerNames } = parseFocusArgs(rawArgs);
-  const intervalMs = parseNumber(process.env.HUNT_INTERVAL_MS, 3000);
-  let lastKnownTarget = null;
-  let missedTargetCount = 0;
+  const args = process.argv.slice(2);
+  const battleX = parseNumber(args[0], NaN);
+  const battleY = parseNumber(args[1], NaN);
+  const attackerNames = args.slice(2);
+  const intervalMs = parseNumber(process.env.BATTLE_INTERVAL_MS, 3000);
+  const radius = Math.max(1, parseNumber(process.env.BATTLE_RADIUS, 8));
+  const enemyRefreshMs = Math.max(intervalMs, parseNumber(process.env.BATTLE_ENEMY_REFRESH_MS, DEFAULT_ENEMY_REFRESH_MS));
+  const focusPoint = { x: battleX, y: battleY };
   const temporaryBlockedCells = new Map();
 
-  if (!targetQuery) {
+  if (!Number.isFinite(battleX) || !Number.isFinite(battleY)) {
     printUsage();
-    throw new Error("Il faut fournir un vaisseau ennemi cible.");
+    throw new Error("Il faut fournir x puis y.");
   }
 
-  printStatus(`Hunt lance sur la cible: ${targetQuery}`);
-  if (focusPoint) {
-    printStatus(`Point de focus: (${focusPoint.x}, ${focusPoint.y})`);
-  }
+  printStatus(`Battle lance vers (${battleX}, ${battleY}) avec rayon ${radius}.`);
   printStatus("Ctrl + C pour arreter.");
 
   while (true) {
     const cycleStartedAt = Date.now();
 
     try {
-      const [alliedShips, team, allShipsOnMap] = await Promise.all([
-        getShips(),
-        getTeamState(),
-        getAllVaisseaux()
-      ]);
+      const [alliedShips, team] = await Promise.all([getShips(), getTeamState()]);
 
       const attackers = buildAttackers(alliedShips, attackerNames);
 
@@ -733,35 +724,17 @@ async function main() {
       }
 
       const teamName = normalizeShipName(team?.nom ?? "");
-      const enemyShips = allShipsOnMap.filter(
-        (ship) => normalizeShipName(ship?.equipe ?? "") !== teamName
-      );
+      refreshEnemyShipsIfNeeded(teamName, enemyRefreshMs);
+      const enemyShips = cachedEnemyShips;
 
-      const targetShip = findTargetShip(enemyShips, targetQuery, attackers, focusPoint);
+      const targetShip = findBestEnemyInZone(enemyShips, focusPoint, attackers, radius);
 
       if (!targetShip) {
-        missedTargetCount += 1;
-
-        if (lastKnownTarget && missedTargetCount >= 2) {
-          printStatus(
-            `Cible ${getShipLabel(lastKnownTarget)} introuvable sur la map globale. Probablement detruite ou hors jeu.`
-          );
-          return;
-        }
-
-        if (!focusPoint) {
-          printStatus(`Cible ${targetQuery} introuvable pour le moment. Nouvelle tentative.`);
-          await sleep(getCycleSleepDelay(cycleStartedAt, intervalMs));
-          continue;
-        }
-
-        printStatus(
-          `Cible ${targetQuery} introuvable pour le moment. Approche de la zone (${focusPoint.x}, ${focusPoint.y}).`
-        );
-
         const occupiedCells = buildOccupiedCells(alliedShips, enemyShips, null, null);
         reserveTemporarilyBlockedCells(occupiedCells, temporaryBlockedCells);
         let actionsDone = 0;
+
+        printStatus(`Aucun ennemi dans la zone (${battleX}, ${battleY}). Regroupement et attente.`);
 
         for (const attacker of [...attackers].sort((left, right) => {
           const readyGap = getShipReadyDelay(left) - getShipReadyDelay(right);
@@ -779,9 +752,16 @@ async function main() {
             continue;
           }
 
+          if (chebyshevDistance(attacker, focusPoint) <= 1) {
+            continue;
+          }
+
           occupiedCells.delete(getCellKey(getX(attacker), getY(attacker)));
           const localLookup = await getLocalCellLookup([attacker, focusPoint], 3);
-          const moveTarget = chooseNextStep(attacker, focusPoint, occupiedCells, localLookup);
+          const stage = pickStagingCell(attacker, focusPoint, occupiedCells, localLookup, attackers);
+          const moveTarget = stage
+            ? chooseNextStep(attacker, stage, occupiedCells, localLookup)
+            : chooseNextStep(attacker, focusPoint, occupiedCells, localLookup);
 
           if (!moveTarget) {
             continue;
@@ -789,7 +769,7 @@ async function main() {
 
           reserveCell(occupiedCells, moveTarget);
           printStatus(
-            `${getShipLabel(attacker)} avance vers la zone: move (${moveTarget.x}, ${moveTarget.y})`
+            `${getShipLabel(attacker)} rejoint la zone de bataille: move (${moveTarget.x}, ${moveTarget.y})`
           );
 
           try {
@@ -822,12 +802,9 @@ async function main() {
         continue;
       }
 
-      missedTargetCount = 0;
-      lastKnownTarget = targetShip;
       const target = { x: getX(targetShip), y: getY(targetShip) };
-
       printStatus(
-        `Cible ${getShipLabel(targetShip)} | equipe ${targetShip.equipe ?? "inconnue"} | PV ${targetShip.pointDeVie ?? "?"} | (${target.x}, ${target.y})`
+        `Cible zone: ${getShipLabel(targetShip)} | equipe ${targetShip.equipe ?? "inconnue"} | PV ${targetShip.pointDeVie ?? "?"} | (${target.x}, ${target.y})`
       );
 
       const occupiedCells = buildOccupiedCells(alliedShips, enemyShips, null, target);
@@ -853,8 +830,7 @@ async function main() {
         }
 
         occupiedCells.delete(getCellKey(getX(attacker), getY(attacker)));
-
-        const targetLookup = await getLocalCellLookup([attacker, target], 3);
+        const targetLookup = await getLocalCellLookup([attacker, target, focusPoint], 3);
 
         if (isAdjacent(attacker, target)) {
           const sidestepCell = chooseRangeAdjustmentCell(
@@ -870,6 +846,7 @@ async function main() {
             printStatus(
               `${getShipLabel(attacker)} se decale pour liberer l'approche: move (${sidestepCell.x}, ${sidestepCell.y})`
             );
+
             try {
               await sendShipAction(attacker.id, "DEPLACEMENT", sidestepCell.x, sidestepCell.y);
             } catch (error) {
@@ -888,6 +865,7 @@ async function main() {
               printStatus(`${getShipLabel(attacker)} reporte son action: ${error.message}`);
               continue;
             }
+
             actionsDone += 1;
             continue;
           }
@@ -962,7 +940,7 @@ async function main() {
 
       const retryDelay = getRetryDelay(error, intervalMs);
       printStatus(
-        `Hunt reporte: ${error.message}. Nouvelle tentative dans ${Math.ceil(
+        `Battle reporte: ${error.message}. Nouvelle tentative dans ${Math.ceil(
           retryDelay / 1000
         )}s`
       );
