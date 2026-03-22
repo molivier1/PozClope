@@ -210,6 +210,15 @@ function parseNumber(value, fallback = 0) {
   return Number.isFinite(numeric) ? numeric : fallback;
 }
 
+function parseCoordInputValue(value) {
+  if (value === '' || value === null || value === undefined) {
+    return Number.NaN;
+  }
+
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : Number.NaN;
+}
+
 function formatShipClassLabel(shipClass) {
   return String(shipClass ?? '')
     .toLowerCase()
@@ -400,6 +409,24 @@ function matchesPlanetFilter(planetLike, filterMode, currentTeamName) {
   }
 
   return true;
+}
+
+function chooseNearestPlanet(originPoint, planets, predicate) {
+  const candidates = planets.filter(predicate);
+
+  if (!candidates.length) {
+    return null;
+  }
+
+  if (!originPoint) {
+    return candidates[0];
+  }
+
+  return [...candidates].sort((left, right) => {
+    const leftDistance = Math.max(Math.abs(left.x - originPoint.x), Math.abs(left.y - originPoint.y));
+    const rightDistance = Math.max(Math.abs(right.x - originPoint.x), Math.abs(right.y - originPoint.y));
+    return leftDistance - rightDistance;
+  })[0];
 }
 
 function getShipReadyDelayMs(ship) {
@@ -734,6 +761,15 @@ function App() {
   const [buildSelectionKey, setBuildSelectionKey] = useState('');
   const [buildShipName, setBuildShipName] = useState('');
   const [buildPending, setBuildPending] = useState(false);
+  const [siegePanelOpen, setSiegePanelOpen] = useState(false);
+  const [siegePending, setSiegePending] = useState(false);
+  const [siegeIncludeNeutral, setSiegeIncludeNeutral] = useState(true);
+  const [siegeStatus, setSiegeStatus] = useState({
+    running: false,
+    logs: [],
+    shipNames: [],
+    includeNeutralTargets: false
+  });
   const [planetFilter, setPlanetFilter] = useState('all');
   const [orderLog, setOrderLog] = useState([]);
   const [hasCentered, setHasCentered] = useState(false);
@@ -961,8 +997,8 @@ function App() {
   );
 
   useEffect(() => {
-    const parsedTargetX = Number(actionTarget.x);
-    const parsedTargetY = Number(actionTarget.y);
+    const parsedTargetX = parseCoordInputValue(actionTarget.x);
+    const parsedTargetY = parseCoordInputValue(actionTarget.y);
     const actionTargetPoint =
       Number.isFinite(parsedTargetX) && Number.isFinite(parsedTargetY)
         ? { x: parsedTargetX, y: parsedTargetY, kind: 'target' }
@@ -1152,8 +1188,8 @@ function App() {
   const minerai = getResourceQuantity(team, 'MINERAI');
   const fleetSlots = getResourceQuantity(team, 'VAISSEAU');
   const fleetCapacity = getResourceQuantity(team, 'EMPLACEMENT_VAISSEAU');
-  const validTargetX = Number(actionTarget.x);
-  const validTargetY = Number(actionTarget.y);
+  const validTargetX = parseCoordInputValue(actionTarget.x);
+  const validTargetY = parseCoordInputValue(actionTarget.y);
   const hasActionTarget = Number.isFinite(validTargetX) && Number.isFinite(validTargetY);
   const lastSyncLabel = lastSyncedAt
     ? new Date(lastSyncedAt).toLocaleTimeString('fr-FR')
@@ -1172,6 +1208,101 @@ function App() {
       ...previous
     ].slice(0, 14));
   };
+
+  const loadSiegeStatus = async () => {
+    try {
+      const response = await fetch('/api/automation/siege-plus');
+      const payload = await response.json();
+
+      if (!response.ok) {
+        throw new Error(payload.error || `Erreur ${response.status}`);
+      }
+
+      setSiegeStatus(payload);
+      setSiegeIncludeNeutral(Boolean(payload.includeNeutralTargets));
+    } catch (error) {
+      console.warn('Siege+ status impossible:', error.message);
+    }
+  };
+
+  const handleToggleSiegePanel = async () => {
+    const nextOpen = !siegePanelOpen;
+    setSiegePanelOpen(nextOpen);
+
+    if (nextOpen) {
+      await loadSiegeStatus();
+    }
+  };
+
+  const handleStartSiege = async () => {
+    const shipIds = selectedShipIds.length > 0
+      ? selectedShipIds
+      : friendlyShips.filter((ship) => !ship.className.includes('CARGO')).map((ship) => ship.id);
+
+    if (!shipIds.length) {
+      appendLog('Siege+ impossible: aucune escouade de combat selectionnee.', 'danger');
+      return;
+    }
+
+    try {
+      setSiegePending(true);
+      const response = await fetch('/api/automation/siege-plus/start', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          shipIds,
+          includeNeutralTargets: siegeIncludeNeutral
+        })
+      });
+      const payload = await response.json();
+
+      if (!response.ok) {
+        throw new Error(payload.error || `Erreur ${response.status}`);
+      }
+
+      setSiegeStatus(payload);
+      appendLog(`Siege+ lance avec ${payload.shipNames?.length ?? shipIds.length} vaisseaux.`, 'success');
+    } catch (error) {
+      appendLog(`Siege+ impossible: ${error.message}`, 'danger');
+    } finally {
+      setSiegePending(false);
+    }
+  };
+
+  const handleStopSiege = async () => {
+    try {
+      setSiegePending(true);
+      const response = await fetch('/api/automation/siege-plus/stop', {
+        method: 'POST'
+      });
+      const payload = await response.json();
+
+      if (!response.ok) {
+        throw new Error(payload.error || `Erreur ${response.status}`);
+      }
+
+      setSiegeStatus(payload);
+      appendLog('Siege+ stoppe.', 'warn');
+    } catch (error) {
+      appendLog(`Arret Siege+ impossible: ${error.message}`, 'danger');
+    } finally {
+      setSiegePending(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!siegePanelOpen && !siegeStatus.running) {
+      return undefined;
+    }
+
+    const interval = window.setInterval(() => {
+      loadSiegeStatus();
+    }, siegeStatus.running ? 2000 : 5000);
+
+    return () => window.clearInterval(interval);
+  }, [siegePanelOpen, siegeStatus.running]);
 
   const suggestShipName = (option) => {
     if (!option) {
@@ -1511,7 +1642,38 @@ function App() {
       return;
     }
 
-    if (!Number.isFinite(targetX) || !Number.isFinite(targetY)) {
+    let resolvedTargetX = targetX;
+    let resolvedTargetY = targetY;
+
+    if (!Number.isFinite(resolvedTargetX) || !Number.isFinite(resolvedTargetY)) {
+      const anchorShip = selectedShips[0] ?? friendlyShips[0] ?? null;
+      const selectedOwnedPlanet =
+        selected?.kind === 'planet' && selected.owner === team?.nom ? selected : null;
+      const fallbackDepositHub =
+        selectedOwnedPlanet && hasPlanetModule(selectedOwnedPlanet, 'DECHARGEMENT_RESSOURCE')
+          ? selectedOwnedPlanet
+          : chooseNearestPlanet(
+              anchorShip,
+              planets,
+              (planet) =>
+                planet.owner === team?.nom &&
+                hasPlanetModule(planet, 'DECHARGEMENT_RESSOURCE') &&
+                !hasPlanetModule(planet, 'GOUVERNANCE_PLANETAIRE')
+            );
+
+      if (action === 'FARM_ZONE' || action === 'DEPOSER') {
+        if (fallbackDepositHub) {
+          resolvedTargetX = fallbackDepositHub.x;
+          resolvedTargetY = fallbackDepositHub.y;
+          setActionTarget({
+            x: String(fallbackDepositHub.x),
+            y: String(fallbackDepositHub.y)
+          });
+        }
+      }
+    }
+
+    if (!Number.isFinite(resolvedTargetX) || !Number.isFinite(resolvedTargetY)) {
       if (!silent) {
         appendLog('Aucune coordonnee cible definie.', 'danger');
       }
@@ -1532,8 +1694,8 @@ function App() {
         setActiveCommandPlan({
           action,
           shipIds: [...shipIds],
-          targetX,
-          targetY,
+          targetX: resolvedTargetX,
+          targetY: resolvedTargetY,
           completedShipIds: []
         });
       }
@@ -1546,8 +1708,8 @@ function App() {
         body: JSON.stringify({
           shipIds,
           action,
-          coord_x: targetX,
-          coord_y: targetY
+          coord_x: resolvedTargetX,
+          coord_y: resolvedTargetY
         })
       });
       const payload = await response.json();
@@ -1583,7 +1745,7 @@ function App() {
       if (!silent) {
         setActionFeedback(payload);
         appendLog(
-          `${formatActionLabel(action)} -> ${payload.summary.success}/${payload.summary.requested} vers [${targetX}:${targetY}]`,
+          `${formatActionLabel(action)} -> ${payload.summary.success}/${payload.summary.requested} vers [${resolvedTargetX}:${resolvedTargetY}]`,
           payload.summary.failed > 0 ? 'warn' : 'success'
         );
       }
@@ -1984,6 +2146,14 @@ function App() {
           </button>
           <button
             type="button"
+            className={`command-button accent ${siegePanelOpen ? 'active' : ''}`}
+            onClick={handleToggleSiegePanel}
+            disabled={Boolean(siegePending)}
+          >
+            Siege+
+          </button>
+          <button
+            type="button"
             className="command-button neutral"
             onClick={() => fetchData({ mode: 'initial', forceLeaderboard: true })}
           >
@@ -2061,6 +2231,82 @@ function App() {
                 </div>
               </>
             )}
+          </div>
+        )}
+
+        {siegePanelOpen && (
+          <div className="build-panel siege-panel">
+            <div className="mini-row">
+              <span>Siege++</span>
+              <span className={`value-neon ${siegeStatus.running ? '' : 'danger'}`}>
+                {siegeStatus.running ? 'RUNNING' : 'IDLE'}
+              </span>
+            </div>
+
+            <div className="siege-panel-meta">
+              <span>Escouade: {selectedShipIds.length || friendlyShips.filter((ship) => !ship.className.includes('CARGO')).length}</span>
+              <span>Neutres: {siegeIncludeNeutral ? 'ON' : 'OFF'}</span>
+            </div>
+
+            <label className="siege-toggle">
+              <input
+                type="checkbox"
+                checked={siegeIncludeNeutral}
+                onChange={(event) => setSiegeIncludeNeutral(event.target.checked)}
+                disabled={siegePending || siegeStatus.running}
+              />
+              Inclure les planetes neutres
+            </label>
+
+            {siegeStatus.shipNames?.length > 0 && (
+              <div className="build-option-meta">
+                {siegeStatus.shipNames.slice(0, 6).map((shipName) => (
+                  <span key={shipName}>{shipName}</span>
+                ))}
+              </div>
+            )}
+
+            <div className="build-actions">
+              <button
+                type="button"
+                className="tiny-button ghost"
+                onClick={loadSiegeStatus}
+                disabled={siegePending}
+              >
+                Refresh
+              </button>
+              {siegeStatus.running ? (
+                <button
+                  type="button"
+                  className="tiny-button"
+                  onClick={handleStopSiege}
+                  disabled={siegePending}
+                >
+                  {siegePending ? 'Stop...' : 'Stop'}
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  className="tiny-button"
+                  onClick={handleStartSiege}
+                  disabled={siegePending}
+                >
+                  {siegePending ? 'Launch...' : 'Lancer'}
+                </button>
+              )}
+            </div>
+
+            <div className="siege-log">
+              {siegeStatus.logs?.length ? (
+                siegeStatus.logs.slice(0, 8).map((entry) => (
+                  <div key={entry.id} className={`log-entry ${entry.tone}`}>
+                    {entry.message}
+                  </div>
+                ))
+              ) : (
+                <div className="empty-state">AUCUN LOG SIEGE.</div>
+              )}
+            </div>
           </div>
         )}
 

@@ -1,6 +1,6 @@
 const fs = require("node:fs");
 const path = require("node:path");
-const { pathToFileURL } = require("node:url");
+const { spawn } = require("node:child_process");
 const express = require("express");
 const dotenv = require("dotenv");
 
@@ -78,6 +78,83 @@ const authState = {
 };
 
 let cachedFullMap = [];
+let cachedLeaderboard = [];
+let cachedLeaderboardFetchedAt = 0;
+const siegeProcessState = {
+  child: null,
+  script: "siege-plus",
+  logs: [],
+  startedAt: null,
+  stoppedAt: null,
+  exitCode: null,
+  includeNeutralTargets: false,
+  shipIds: [],
+  shipNames: []
+};
+
+function pushSiegeLog(message, tone = "neutral") {
+  siegeProcessState.logs.unshift({
+    id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    message: String(message ?? "").trim(),
+    tone,
+    timestamp: new Date().toISOString()
+  });
+  siegeProcessState.logs = siegeProcessState.logs.slice(0, 80);
+}
+
+function getSiegeStatusPayload() {
+  return {
+    running: Boolean(siegeProcessState.child && siegeProcessState.child.exitCode === null),
+    pid: siegeProcessState.child?.pid ?? null,
+    script: siegeProcessState.script,
+    startedAt: siegeProcessState.startedAt,
+    stoppedAt: siegeProcessState.stoppedAt,
+    exitCode: siegeProcessState.exitCode,
+    includeNeutralTargets: siegeProcessState.includeNeutralTargets,
+    shipIds: siegeProcessState.shipIds,
+    shipNames: siegeProcessState.shipNames,
+    logs: siegeProcessState.logs
+  };
+}
+
+function stopSiegeProcess() {
+  if (!siegeProcessState.child || siegeProcessState.child.exitCode !== null) {
+    siegeProcessState.child = null;
+    return false;
+  }
+
+  siegeProcessState.child.kill("SIGINT");
+  return true;
+}
+
+function attachProcessLogger(child, tone) {
+  let buffer = "";
+
+  const flushLines = (chunk) => {
+    buffer += chunk.toString();
+    const lines = buffer.split(/\r?\n/);
+    buffer = lines.pop() ?? "";
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+
+      if (trimmed) {
+        pushSiegeLog(trimmed, tone);
+      }
+    }
+  };
+
+  return {
+    onData: flushLines,
+    flushRemainder() {
+      const trimmed = buffer.trim();
+
+      if (trimmed) {
+        pushSiegeLog(trimmed, tone);
+      }
+    }
+  };
+}
 let cachedFullMapFetchedAt = 0;
 let isFetchingMap = false;
 let cachedEnemyShips = [];
@@ -273,6 +350,46 @@ function parseRange(rawValue, fallback) {
   }
 
   return clampRange(parts);
+}
+
+function filterCellsByRange(cells, xRange, yRange) {
+  return cells.filter(
+    (cell) =>
+      cell.coord_x >= xRange[0] &&
+      cell.coord_x <= xRange[1] &&
+      cell.coord_y >= yRange[0] &&
+      cell.coord_y <= yRange[1]
+  );
+}
+
+async function getMapCellsWithFallback(xRange, yRange) {
+  const pathname = `/monde/map?x_range=${xRange.join(",")}&y_range=${yRange.join(",")}`;
+
+  try {
+    const payload = await apiGet(pathname);
+    return extractArray(payload).map(normalizeCell).filter(Boolean);
+  } catch (error) {
+    const isLargeRequest = (xRange[1] - xRange[0] > 20) || (yRange[1] - yRange[0] > 20);
+
+    if (!cachedFullMap.length || Date.now() - cachedFullMapFetchedAt > 20_000) {
+      try {
+        const chunked = await fetchFullMapChunks();
+
+        if (chunked.length) {
+          cachedFullMap = chunked;
+          cachedFullMapFetchedAt = Date.now();
+        }
+      } catch {
+        // Fallback to current cache below.
+      }
+    }
+
+    if (cachedFullMap.length) {
+      return isLargeRequest ? cachedFullMap : filterCellsByRange(cachedFullMap, xRange, yRange);
+    }
+
+    throw error;
+  }
 }
 
 function getCellKey(x, y) {
@@ -2044,6 +2161,19 @@ function isOutOfRangeActionError(error) {
   return message.includes("hors portee");
 }
 
+function isOccupiedTargetActionError(error) {
+  const message = String(error?.message ?? "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+
+  return message.includes("case cible deja occupee");
+}
+
+function isRepathableActionError(error) {
+  return isOutOfRangeActionError(error) || isOccupiedTargetActionError(error);
+}
+
 function getFleetCenter(ships) {
   if (!ships.length) {
     return null;
@@ -2621,6 +2751,8 @@ async function fetchLeaderboard() {
 
     if (leaderboard.length) {
       cachedLeaderboardPath = pathname;
+      cachedLeaderboard = leaderboard;
+      cachedLeaderboardFetchedAt = Date.now();
 
       return {
         sourcePath: pathname,
@@ -2748,38 +2880,25 @@ app.get("/api/ships", ensureConfig, async (req, res, next) => {
 
 app.get("/api/vaisseaux/all", ensureConfig, async (req, res, next) => {
   try {
-    const teamPayload = await apiGet(`/equipes/${TEAM_ID}`);
-    const teamName = normalizeTeam(teamPayload)?.nom ?? null;
-    const moduleUrl = pathToFileURL(path.join(ROOT_DIR, "Backend", "getAllVaisseaux.js")).href;
-    const { getAllVaisseaux } = await import(moduleUrl);
-    const rawShips = await getAllVaisseaux();
-    const ships = extractArray(rawShips)
-      .filter((ship) => ship?.equipe && ship.equipe !== teamName)
-      .map((ship, index) => ({
-        identifiant: ship.idVaisseau ?? ship.identifiant ?? ship.id ?? `enemy-${index}`,
-        nom: ship.nom ?? `Vaisseau ennemi ${index + 1}`,
-        proprietaire: {
-          identifiant: ship.idEquipe ?? ship.proprietaire ?? ship.equipe ?? null,
-          nom: ship.equipe ?? ship.nomEquipe ?? "Inconnu"
-        },
-        type: ship.type ?? null,
-        classeVaisseau: ship.classe ?? ship.classeVaisseau ?? null,
-        coord_x: Number(ship.coord_x ?? ship.x ?? 0),
-        coord_y: Number(ship.coord_y ?? ship.y ?? 0),
-        pointDeVie: Number(ship.pointDeVie ?? 0),
-        vitesse: Number(ship.vitesse ?? 0),
-        mineraiTransporte: Number(ship.mineraiTransporte ?? 0),
-        capaciteTransport: Number(ship.capaciteTransport ?? 0),
-        attaque: Number(ship.attaque ?? 0),
-        coutConstruction: Number(ship.coutConstruction ?? 0),
-        dateProchaineAction: ship.dateProchaineAction ?? null
-      }));
+    const ships = await getKnownEnemyShips();
 
     res.json({
       fetchedAt: new Date().toISOString(),
       ships
     });
   } catch (error) {
+    if (cachedEnemyShips.length) {
+      res.json({
+        fetchedAt: new Date().toISOString(),
+        stale: true,
+        staleFetchedAt: cachedEnemyShipsFetchedAt
+          ? new Date(cachedEnemyShipsFetchedAt).toISOString()
+          : null,
+        ships: cachedEnemyShips
+      });
+      return;
+    }
+
     next(error);
   }
 });
@@ -2788,18 +2907,7 @@ app.get("/api/map", ensureConfig, async (req, res, next) => {
   try {
     const xRange = parseRange(req.query.x_range, DEFAULT_RANGE.x);
     const yRange = parseRange(req.query.y_range, DEFAULT_RANGE.y);
-
-    let cells = [];
-    const isLargeRequest = (xRange[1] - xRange[0] > 20) || (yRange[1] - yRange[0] > 20);
-    
-    if (isLargeRequest && cachedFullMap.length > 0) {
-      cells = cachedFullMap;
-    } else {
-      const payload = await apiGet(
-        `/monde/map?x_range=${xRange.join(",")}&y_range=${yRange.join(",")}`
-      );
-      cells = extractArray(payload).map(normalizeCell).filter(Boolean);
-    }
+    const cells = await getMapCellsWithFallback(xRange, yRange);
 
     res.json({
       range: { x: xRange, y: yRange },
@@ -2825,25 +2933,7 @@ app.get("/api/state", ensureConfig, async (req, res, next) => {
     const xRange = parseRange(req.query.x_range, suggestedRange.x);
     const yRange = parseRange(req.query.y_range, suggestedRange.y);
     const includePlan = String(req.query.include_plan ?? "1") !== "0";
-    const isLargeRequest = (xRange[1] - xRange[0] > 20) || (yRange[1] - yRange[0] > 20);
-    let cells = [];
-
-    if (isLargeRequest && cachedFullMap.length > 0) {
-      cells = cachedFullMap.filter(
-        (cell) =>
-          cell.coord_x >= xRange[0] &&
-          cell.coord_x <= xRange[1] &&
-          cell.coord_y >= yRange[0] &&
-          cell.coord_y <= yRange[1]
-      );
-    } else {
-      const mapPayload = await apiGet(
-        `/monde/map?x_range=${xRange.join(",")}&y_range=${yRange.join(",")}`
-      );
-      cells = extractArray(mapPayload)
-        .map(normalizeCell)
-        .filter(Boolean);
-    }
+    const cells = await getMapCellsWithFallback(xRange, yRange);
     const economyPlan = includePlan
       ? buildEconomyPlan(team, ships, cells, {
           x: xRange,
@@ -2908,6 +2998,19 @@ app.get("/api/leaderboard", ensureConfig, async (req, res, next) => {
       leaderboard: result.leaderboard
     });
   } catch (error) {
+    if (cachedLeaderboard.length) {
+      res.json({
+        fetchedAt: new Date().toISOString(),
+        sourcePath: cachedLeaderboardPath,
+        stale: true,
+        staleFetchedAt: cachedLeaderboardFetchedAt
+          ? new Date(cachedLeaderboardFetchedAt).toISOString()
+          : null,
+        leaderboard: cachedLeaderboard
+      });
+      return;
+    }
+
     next(error);
   }
 });
@@ -3008,6 +3111,125 @@ app.post("/api/build/ships", ensureConfig, async (req, res, next) => {
   }
 });
 
+app.get("/api/automation/siege-plus", ensureConfig, async (req, res) => {
+  res.json(getSiegeStatusPayload());
+});
+
+app.post("/api/automation/siege-plus/start", ensureConfig, async (req, res, next) => {
+  try {
+    if (siegeProcessState.child && siegeProcessState.child.exitCode === null) {
+      throw createHttpError("Siege+ est deja lance.", 409);
+    }
+
+    const includeNeutralTargets = Boolean(req.body?.includeNeutralTargets);
+    const requestedShipIds = [
+      ...(Array.isArray(req.body?.shipIds) ? req.body.shipIds : []),
+      ...(req.body?.shipId ? [req.body.shipId] : [])
+    ]
+      .map((value) => String(value ?? "").trim())
+      .filter(Boolean);
+
+    const teamPayload = await apiGet(`/equipes/${TEAM_ID}`);
+    const shipsPayload = await apiGet(`/equipes/${TEAM_ID}/vaisseaux`);
+    const ships = filterActiveShips(
+      extractArray(shipsPayload)
+        .map(normalizeShip)
+        .filter(Boolean),
+      teamPayload
+    );
+    const selectedShips =
+      requestedShipIds.length > 0
+        ? ships.filter((ship) => requestedShipIds.includes(String(ship.identifiant)))
+        : ships.filter(
+            (ship) =>
+              !String(ship.classeVaisseau ?? ship.classe ?? "")
+                .toUpperCase()
+                .includes("CARGO")
+          );
+
+    if (selectedShips.length === 0) {
+      throw createHttpError(
+        "Aucun vaisseau de siege selectionne. Selectionne une escouade ou garde des vaisseaux de combat actifs.",
+        400
+      );
+    }
+
+    siegeProcessState.logs = [];
+    siegeProcessState.startedAt = new Date().toISOString();
+    siegeProcessState.stoppedAt = null;
+    siegeProcessState.exitCode = null;
+    siegeProcessState.includeNeutralTargets = includeNeutralTargets;
+    siegeProcessState.shipIds = selectedShips.map((ship) => String(ship.identifiant));
+    siegeProcessState.shipNames = selectedShips.map((ship) => ship.nom);
+    siegeProcessState.script = "siege-plus";
+
+    const child = spawn(
+      process.execPath,
+      [
+        path.join(ROOT_DIR, "scripts", "siege-plus.js"),
+        ...siegeProcessState.shipNames
+      ],
+      {
+        cwd: ROOT_DIR,
+        env: {
+          ...process.env,
+          SIEGE_INCLUDE_NEUTRAL: includeNeutralTargets ? "1" : "0"
+        },
+        stdio: ["ignore", "pipe", "pipe"]
+      }
+    );
+
+    siegeProcessState.child = child;
+    pushSiegeLog(
+      `Siege+ lance avec ${siegeProcessState.shipNames.join(", ")}${includeNeutralTargets ? " | neutres inclus" : ""}`,
+      "success"
+    );
+
+    const stdoutLogger = attachProcessLogger(child, "neutral");
+    const stderrLogger = attachProcessLogger(child, "warn");
+    child.stdout.on("data", stdoutLogger.onData);
+    child.stderr.on("data", stderrLogger.onData);
+
+    child.on("error", (error) => {
+      pushSiegeLog(`Siege+ erreur: ${error.message}`, "danger");
+    });
+
+    child.on("exit", (code, signal) => {
+      stdoutLogger.flushRemainder();
+      stderrLogger.flushRemainder();
+      siegeProcessState.exitCode = Number.isInteger(code) ? code : null;
+      siegeProcessState.stoppedAt = new Date().toISOString();
+      pushSiegeLog(
+        `Siege+ arrete${signal ? ` (${signal})` : ""}${Number.isInteger(code) ? ` | code ${code}` : ""}`,
+        code === 0 || signal === "SIGINT" ? "warn" : "danger"
+      );
+      siegeProcessState.child = null;
+    });
+
+    res.status(202).json(getSiegeStatusPayload());
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/automation/siege-plus/stop", ensureConfig, async (req, res, next) => {
+  try {
+    const stopped = stopSiegeProcess();
+
+    if (!stopped) {
+      throw createHttpError("Siege+ n'est pas en cours.", 409);
+    }
+
+    pushSiegeLog("Arret manuel de Siege+ demande.", "warn");
+    res.json({
+      stopped: true,
+      ...getSiegeStatusPayload()
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.post("/api/actions/ships", ensureConfig, async (req, res, next) => {
   try {
     const shipIds = [
@@ -3029,7 +3251,10 @@ app.post("/api/actions/ships", ensureConfig, async (req, res, next) => {
       throw createHttpError(`Action invalide: ${action || "?"}.`, 400);
     }
 
-    if (!Number.isFinite(coordX) || !Number.isFinite(coordY)) {
+    if (
+      action !== "FARM_ZONE" &&
+      (!Number.isFinite(coordX) || !Number.isFinite(coordY))
+    ) {
       throw createHttpError("Coordonnees invalides pour l'action demandee.", 400);
     }
 
@@ -3051,24 +3276,12 @@ app.post("/api/actions/ships", ensureConfig, async (req, res, next) => {
 
     let farmHub = null;
     if (action === "FARM_ZONE") {
-      farmHub = findTeamPlanetByCoords(team, coordX, coordY);
+      if (Number.isFinite(coordX) && Number.isFinite(coordY)) {
+        const requestedFarmHub = findTeamPlanetByCoords(team, coordX, coordY);
 
-      if (!farmHub) {
-        throw createHttpError(
-          `Aucune planete a vous trouvee en [${coordX}:${coordY}].`,
-          404
-        );
-      }
-
-      if (
-        !farmHub.modules.some(
-          (module) => module.typeModule === "DECHARGEMENT_RESSOURCE"
-        )
-      ) {
-        throw createHttpError(
-          `${farmHub.nom} n'a pas de module de dechargement.`,
-          409
-        );
+        if (requestedFarmHub && isValidDepositHub(requestedFarmHub)) {
+          farmHub = requestedFarmHub;
+        }
       }
     }
 
@@ -3125,12 +3338,21 @@ app.post("/api/actions/ships", ensureConfig, async (req, res, next) => {
             : { x: coordX, y: coordY };
 
         let actingShip = ship;
+        const resolvedFarmHub =
+          action === "FARM_ZONE" ? farmHub ?? chooseNearestDepositHub(ship, team) : null;
+
+        if (action === "FARM_ZONE" && !resolvedFarmHub) {
+          throw createHttpError(
+            "Aucun hub de depot valide trouve pour lancer farm-cargos.",
+            409
+          );
+        }
         let finalResolvedAction =
           action === "FARM_ZONE"
             ? await resolveFarmZoneAction(
                 ship,
                 team,
-                farmHub,
+                resolvedFarmHub,
                 occupiedCells,
                 ships,
                 farmRadius
@@ -3162,7 +3384,7 @@ app.post("/api/actions/ships", ensureConfig, async (req, res, next) => {
               issuedCoordY
             );
           } catch (error) {
-            if (!isOutOfRangeActionError(error)) {
+            if (!isRepathableActionError(error)) {
               throw error;
             }
 
@@ -3190,7 +3412,11 @@ app.post("/api/actions/ships", ensureConfig, async (req, res, next) => {
             );
             const refreshedFarmHub =
               action === "FARM_ZONE"
-                ? findTeamPlanetByCoords(freshTeam, coordX, coordY) ?? farmHub
+                ? farmHub ??
+                  chooseNearestDepositHub(freshShip, freshTeam) ??
+                  (Number.isFinite(coordX) && Number.isFinite(coordY)
+                    ? findTeamPlanetByCoords(freshTeam, coordX, coordY)
+                    : null)
                 : null;
 
             actingShip = freshShip;

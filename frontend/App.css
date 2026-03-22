@@ -850,6 +850,36 @@ input {
   justify-content: flex-end;
 }
 
+.siege-panel {
+  margin-top: 10px;
+}
+
+.siege-panel-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 10px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+}
+
+.siege-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--accent-bright);
+}
+
+.siege-log {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 180px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
 .feedback-box {
   margin-top: 12px;
   padding-top: 12px;
